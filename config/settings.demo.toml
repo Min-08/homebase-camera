@@ -3,39 +3,39 @@ auto_refresh_enabled = true
 refresh_interval_seconds = 3
 
 [camera]
-source = "picamera2"
+source = "demo"
 device_index = 0
-mock_image_path = "data/snapshots/mock.jpg"
+mock_image_path = "demo/frames/000_empty.jpg"
 mock_video_path = ""
 frame_width = 1280
 frame_height = 720
 
 [detection]
 diff_interval_seconds = 3
-yolo_enabled = true
+yolo_enabled = false
 yolo_interval_seconds = 20
 yolo_model = "yolov8n.pt"
 object_occupancy_enabled = true
-object_conservativeness = 5
-empty_required_hits = 2
+object_conservativeness = 0
+empty_required_hits = 1
 person_required_hits = 1
 diff_threshold = 30
 change_ratio_threshold = 0.04
-baseline_path = "data/snapshots/baseline.jpg"
+baseline_path = "demo/frames/000_empty.jpg"
 
 [storage]
-db_path = "data/status.db"
+db_path = "data/status.demo.db"
 timeout_seconds = 10
 busy_timeout_ms = 5000
 wal_enabled = true
 
 [privacy]
 save_raw_video = false
-save_snapshots = true
+save_snapshots = false
 snapshot_interval_seconds = 30
 
 [demo]
-enabled = false
+enabled = true
 timeline_path = "demo/demo_timeline.json"
 seats_path = "demo/demo_seats.json"
 assets_dir = "demo/frames"

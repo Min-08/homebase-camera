@@ -103,6 +103,21 @@ class SeatStateEngine:
     def reset(self) -> None:
         self._history.clear()
 
+    def restore_statuses(self, rows: Iterable[dict]) -> None:
+        for row in rows:
+            seat_id = str(row.get("seat_id", "")).strip()
+            if not seat_id:
+                continue
+            status = int(row.get("status", STATUS_EMPTY))
+            confidence = float(row.get("confidence", 0.0) or 0.0)
+            self._history[seat_id] = _SeatHistory(
+                status=status,
+                person_hits=self.person_required_hits if status == STATUS_PERSON else 0,
+                object_hits=self.required_object_hits if status == STATUS_OBJECT else 0,
+                empty_hits=self.empty_required_hits if status == STATUS_EMPTY else 0,
+                last_confidence=confidence,
+            )
+
     def update_all(
         self,
         zones: Iterable[Zone],

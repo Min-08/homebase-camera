@@ -3,9 +3,12 @@
 __all__ = [
     "capture",
     "config",
+    "demo",
     "diff_detector",
+    "scheduler",
     "state_engine",
     "storage",
+    "validation",
     "visualization",
     "yolo_detector",
     "zones",

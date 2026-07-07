@@ -37,3 +37,12 @@ def test_reset_logs(tmp_path):
     store.reset_logs()
 
     assert store.get_log() == []
+
+
+def test_storage_initializes_busy_timeout_and_wal(tmp_path):
+    store = StatusStore(tmp_path / "status.db", busy_timeout_ms=4321, wal_enabled=True)
+
+    pragmas = store.pragmas()
+
+    assert pragmas["busy_timeout"] == 4321
+    assert str(pragmas["journal_mode"]).lower() == "wal"

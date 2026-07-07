@@ -44,8 +44,8 @@ class YoloDetector:
     def should_run(self) -> bool:
         return self.enabled and self.status.available and (time.monotonic() - self._last_run) >= self.interval_seconds
 
-    def detect(self, frame: np.ndarray, zones: Iterable[Zone]) -> dict[str, ZoneEvidence]:
-        if not self.should_run():
+    def detect(self, frame: np.ndarray, zones: Iterable[Zone], *, force: bool = False) -> dict[str, ZoneEvidence]:
+        if not force and not self.should_run():
             return {}
 
         self._last_run = time.monotonic()

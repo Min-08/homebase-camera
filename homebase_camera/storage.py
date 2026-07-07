@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -29,23 +30,33 @@ CREATE TABLE IF NOT EXISTS status_log(
 
 
 class StatusStore:
-    def __init__(self, db_path: str | Path = "data/status.db") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = "data/status.db",
+        *,
+        timeout_seconds: int = 10,
+        busy_timeout_ms: int = 5000,
+        wal_enabled: bool = True,
+        retries: int = 3,
+    ) -> None:
         self.db_path = resolve_path(db_path)
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.busy_timeout_ms = max(100, int(busy_timeout_ms))
+        self.wal_enabled = bool(wal_enabled)
+        self.retries = max(1, int(retries))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            self._configure_connection(conn)
             conn.executescript(SCHEMA)
 
     def upsert_many(self, decisions: Iterable[SeatDecision]) -> None:
-        with self._connect() as conn:
-            for decision in decisions:
-                self._upsert(conn, decision)
+        self._write_with_retry(lambda conn: [self._upsert(conn, decision) for decision in decisions])
 
     def upsert(self, decision: SeatDecision) -> None:
-        with self._connect() as conn:
-            self._upsert(conn, decision)
+        self._write_with_retry(lambda conn: self._upsert(conn, decision))
 
     def get_current(self) -> list[dict]:
         with self._connect() as conn:
@@ -68,8 +79,13 @@ class StatusStore:
         return [dict(row) for row in rows]
 
     def reset_logs(self) -> None:
+        self._write_with_retry(lambda conn: conn.execute("DELETE FROM status_log"))
+
+    def pragmas(self) -> dict[str, object]:
         with self._connect() as conn:
-            conn.execute("DELETE FROM status_log")
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        return {"journal_mode": journal_mode, "busy_timeout": busy_timeout}
 
     def _upsert(self, conn: sqlite3.Connection, decision: SeatDecision) -> None:
         previous = conn.execute(
@@ -98,6 +114,27 @@ class StatusStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=self.timeout_seconds)
         conn.row_factory = sqlite3.Row
+        self._configure_connection(conn)
         return conn
+
+    def _configure_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+        if self.wal_enabled:
+            conn.execute("PRAGMA journal_mode = WAL")
+
+    def _write_with_retry(self, callback) -> None:
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(self.retries):
+            try:
+                with self._connect() as conn:
+                    callback(conn)
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+        if last_error is not None:
+            raise last_error

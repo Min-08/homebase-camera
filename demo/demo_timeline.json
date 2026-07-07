@@ -1,0 +1,228 @@
+{
+  "steps": [
+    {
+      "frame": "000_empty.jpg",
+      "label": "All seats empty",
+      "expected_status": {
+        "seat_001": 0,
+        "seat_002": 0,
+        "seat_003": 0
+      },
+      "evidence": {
+        "seat_001": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_002": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_003": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        }
+      }
+    },
+    {
+      "frame": "001_person_seat_1.jpg",
+      "label": "Person sits in Seat 1",
+      "expected_status": {
+        "seat_001": 1,
+        "seat_002": 0,
+        "seat_003": 0
+      },
+      "evidence": {
+        "seat_001": {
+          "status": 1,
+          "diff_changed": true,
+          "diff_ratio": 0.25,
+          "person_detected": true,
+          "person_confidence": 0.92,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_002": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_003": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        }
+      }
+    },
+    {
+      "frame": "002_object_seat_1.jpg",
+      "label": "Seat 1 temporarily left with bag",
+      "expected_status": {
+        "seat_001": 2,
+        "seat_002": 0,
+        "seat_003": 0
+      },
+      "evidence": {
+        "seat_001": {
+          "status": 2,
+          "diff_changed": true,
+          "diff_ratio": 0.25,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": true,
+          "object_confidence": 0.86,
+          "object_classes": [
+            "backpack"
+          ],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_002": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_003": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        }
+      }
+    },
+    {
+      "frame": "003_mixed.jpg",
+      "label": "Mixed occupancy",
+      "expected_status": {
+        "seat_001": 2,
+        "seat_002": 1,
+        "seat_003": 0
+      },
+      "evidence": {
+        "seat_001": {
+          "status": 2,
+          "diff_changed": true,
+          "diff_ratio": 0.25,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": true,
+          "object_confidence": 0.86,
+          "object_classes": [
+            "backpack"
+          ],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_002": {
+          "status": 1,
+          "diff_changed": true,
+          "diff_ratio": 0.25,
+          "person_detected": true,
+          "person_confidence": 0.92,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_003": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        }
+      }
+    },
+    {
+      "frame": "004_empty_again.jpg",
+      "label": "All seats empty again",
+      "expected_status": {
+        "seat_001": 0,
+        "seat_002": 0,
+        "seat_003": 0
+      },
+      "evidence": {
+        "seat_001": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_002": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        },
+        "seat_003": {
+          "status": 0,
+          "diff_changed": false,
+          "diff_ratio": 0.0,
+          "person_detected": false,
+          "person_confidence": 0.0,
+          "object_detected": false,
+          "object_confidence": 0.0,
+          "object_classes": [],
+          "message": "synthetic demo evidence; not real AI detection"
+        }
+      }
+    }
+  ]
+}

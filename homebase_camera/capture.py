@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -24,45 +26,57 @@ class CaptureManager:
         self.camera_config = config.camera
         self._picamera: Any | None = None
         self._cv_capture: Any | None = None
+        self._lock = threading.Lock()
+        self._last_snapshot_save_monotonic = 0.0
         self.last_message = ""
 
     def read_frame(self) -> FrameResult:
-        source = self.camera_config.source.lower()
-        if self.app_config.mock_mode or source == "mock":
-            return self._read_mock_frame()
-        if source == "picamera2":
-            result = self._read_picamera2()
-            if result.ok:
-                return result
-            return self._placeholder(result.message)
-        if source in {"opencv", "usb", "video"}:
-            result = self._read_opencv()
-            if result.ok:
-                return result
-            return self._placeholder(result.message)
-        return self._placeholder(f"Unknown camera source '{self.camera_config.source}'. Use picamera2, opencv, video, or mock.")
+        with self._lock:
+            source = self.camera_config.source.lower()
+            if self.app_config.mock_mode or source == "mock":
+                return self._read_mock_frame()
+            if source == "picamera2":
+                result = self._read_picamera2()
+                if result.ok:
+                    return result
+                return self._placeholder(result.message)
+            if source in {"opencv", "usb", "video"}:
+                result = self._read_opencv()
+                if result.ok:
+                    return result
+                return self._placeholder(result.message)
+            if source == "demo":
+                return self._read_mock_frame()
+            return self._placeholder(f"Unknown camera source '{self.camera_config.source}'. Use picamera2, opencv, video, demo, or mock.")
 
     def save_latest_snapshot(self, frame: np.ndarray) -> Path | None:
         if not self.app_config.privacy.save_snapshots:
             return None
-        path = resolve_path("data/snapshots/latest.jpg", self.app_config.project_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(_ensure_rgb(frame)).save(path)
-        return path
+        now = time.monotonic()
+        interval = max(1, int(self.app_config.privacy.snapshot_interval_seconds))
+        with self._lock:
+            if self._last_snapshot_save_monotonic and now - self._last_snapshot_save_monotonic < interval:
+                return None
+            path = resolve_path("data/snapshots/latest.jpg", self.app_config.project_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(_ensure_rgb(frame)).save(path)
+            self._last_snapshot_save_monotonic = now
+            return path
 
     def close(self) -> None:
-        if self._picamera is not None:
-            try:
-                self._picamera.stop()
-            except Exception:
-                pass
-            self._picamera = None
-        if self._cv_capture is not None:
-            try:
-                self._cv_capture.release()
-            except Exception:
-                pass
-            self._cv_capture = None
+        with self._lock:
+            if self._picamera is not None:
+                try:
+                    self._picamera.stop()
+                except Exception:
+                    pass
+                self._picamera = None
+            if self._cv_capture is not None:
+                try:
+                    self._cv_capture.release()
+                except Exception:
+                    pass
+                self._cv_capture = None
 
     def _read_mock_frame(self) -> FrameResult:
         image_path = resolve_path(self.camera_config.mock_image_path, self.app_config.project_root)

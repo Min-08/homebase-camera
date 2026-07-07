@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
 import streamlit as st
 from PIL import Image
 
-from homebase_camera.capture import CaptureManager
-from homebase_camera.config import ConfigError, load_settings, resolve_path
+from homebase_camera.capture import CaptureManager, FrameResult
+from homebase_camera.config import AppConfig, ConfigError, load_settings, resolve_path
+from homebase_camera.demo import (
+    DemoError,
+    DemoStep,
+    demo_evidence_for_step,
+    is_demo_mode,
+    load_demo_frame,
+    load_demo_timeline,
+)
 from homebase_camera.diff_detector import DiffDetector
-from homebase_camera.state_engine import STATUS_LABELS, SeatStateEngine, ZoneEvidence
+from homebase_camera.scheduler import IntervalGate, RuntimeSnapshot
+from homebase_camera.state_engine import SeatDecision, SeatStateEngine, ZoneEvidence
 from homebase_camera.storage import StatusStore
+from homebase_camera.validation import polygon_area, validate_zones
 from homebase_camera.visualization import STATUS_COLORS, STATUS_SHORT_LABELS, draw_zones
 from homebase_camera.yolo_detector import YoloDetector
 from homebase_camera.zones import Zone, ZoneConfigError, load_zones, save_zones
@@ -29,112 +41,227 @@ def main() -> None:
         st.stop()
 
     _ensure_runtime_dirs(config)
-
+    demo_mode = is_demo_mode(config)
     st.title("Homebase Camera")
-    st.caption("Local Raspberry Pi seat occupancy detector: 0 empty, 1 person, 2 temporarily left/object.")
+    if demo_mode:
+        st.caption("PC demo mode: generated frames and demo evidence. This is for presentation and mapping practice.")
+    else:
+        st.caption("Local Raspberry Pi seat occupancy detector: 0 empty, 1 person, 2 temporarily left/object.")
 
     for warning in config.warnings:
         st.info(warning)
 
-    try:
-        zone_result = load_zones()
-        zones = list(zone_result.zones)
-    except ZoneConfigError as exc:
-        zones = []
-        st.error(f"Zone configuration problem: {exc}")
-        zone_result = None
+    runtime_detection, ui_state = _sidebar_controls(config, demo_mode)
+    refresh_count = _auto_refresh(ui_state)
+    demo_step = _demo_controls(config, demo_mode, refresh_count, ui_state)
 
-    if zone_result:
-        for warning in zone_result.warnings:
-            st.warning(warning)
-
-    runtime_detection = _sidebar_controls(config.detection)
-    frame_result = _capture(config)
+    zones, editor_zones, zone_source = _load_zone_sets(config, demo_mode)
+    frame_result = _get_frame(config, demo_mode, demo_step)
     frame = frame_result.frame
 
-    if frame_result.ok:
+    if frame_result.ok and not demo_mode:
         _capture_manager(config).save_latest_snapshot(frame)
-    else:
+    elif not frame_result.ok:
         st.warning(frame_result.message)
+
+    if zone_source:
+        st.caption(f"Zone source: `{_display_path(zone_source, config.project_root)}`")
+    _show_zone_warnings(editor_zones, frame.shape)
 
     tab_monitor, tab_editor, tab_logs, tab_settings = st.tabs(["Monitor", "Zone Editor", "Logs", "Settings"])
 
     with tab_monitor:
-        _monitor_tab(config, runtime_detection, frame, frame_result.message, zones)
+        _monitor_tab(config, runtime_detection, frame, frame_result.message, zones, demo_step)
 
     with tab_editor:
-        _zone_editor_tab(frame, zones)
+        _zone_editor_tab(config, frame, editor_zones, demo_mode)
 
     with tab_logs:
         _logs_tab(config)
 
     with tab_settings:
-        _settings_tab(config, runtime_detection)
+        _settings_tab(config, runtime_detection, ui_state, demo_mode)
 
 
-def _sidebar_controls(detection_config):
+def _sidebar_controls(config: AppConfig, demo_mode: bool):
     st.sidebar.header("Runtime Controls")
-    yolo_enabled = st.sidebar.toggle("YOLO correction", value=bool(detection_config.yolo_enabled))
+    auto_refresh = st.sidebar.toggle("Auto-refresh", value=bool(config.ui.auto_refresh_enabled))
+    refresh_interval = st.sidebar.slider(
+        "Refresh interval seconds",
+        min_value=1,
+        max_value=30,
+        value=int(config.ui.refresh_interval_seconds),
+    )
+    manual_refresh = st.sidebar.button("Manual refresh")
+    if manual_refresh:
+        st.rerun()
+
+    st.sidebar.divider()
+    yolo_enabled = st.sidebar.toggle(
+        "YOLO correction",
+        value=False if demo_mode else bool(config.detection.yolo_enabled),
+        disabled=demo_mode,
+        help="Disabled in PC demo mode. Demo evidence is generated, not YOLO output.",
+    )
     object_enabled = st.sidebar.toggle(
         "Object occupancy",
-        value=bool(detection_config.object_occupancy_enabled),
+        value=bool(config.detection.object_occupancy_enabled),
         help="When disabled, status 2 is never published.",
     )
     conservativeness = st.sidebar.slider(
         "Object conservativeness",
         min_value=0,
         max_value=10,
-        value=int(detection_config.object_conservativeness),
+        value=int(config.detection.object_conservativeness),
         help="0 triggers status 2 easily; 10 requires stronger repeated evidence.",
     )
-    st.sidebar.metric("YOLO interval", f"{detection_config.yolo_interval_seconds}s")
-    st.sidebar.metric("Diff interval target", f"{detection_config.diff_interval_seconds}s")
-    st.sidebar.button("Refresh frame")
+    st.sidebar.metric("YOLO interval", f"{config.detection.yolo_interval_seconds}s")
+    st.sidebar.metric("Diff interval target", f"{config.detection.diff_interval_seconds}s")
 
-    return replace(
-        detection_config,
+    runtime_detection = replace(
+        config.detection,
         yolo_enabled=yolo_enabled,
         object_occupancy_enabled=object_enabled,
         object_conservativeness=conservativeness,
     )
+    ui_state = {
+        "auto_refresh": auto_refresh,
+        "refresh_interval": refresh_interval,
+        "manual_refresh": manual_refresh,
+    }
+    return runtime_detection, ui_state
 
 
-def _monitor_tab(config, runtime_detection, frame: np.ndarray, frame_message: str, zones: list[Zone]) -> None:
+def _auto_refresh(ui_state: dict[str, Any]) -> int:
+    if not ui_state["auto_refresh"]:
+        return int(st.session_state.get("auto_refresh_count", 0))
+    try:
+        from streamlit_autorefresh import st_autorefresh  # type: ignore
+    except Exception as exc:
+        st.sidebar.warning(f"Auto-refresh package is unavailable: {exc}")
+        return int(st.session_state.get("auto_refresh_count", 0))
+
+    count = int(
+        st_autorefresh(
+            interval=max(1, int(ui_state["refresh_interval"])) * 1000,
+            key="homebase_auto_refresh",
+        )
+    )
+    st.session_state.auto_refresh_count = count
+    return count
+
+
+def _demo_controls(config: AppConfig, demo_mode: bool, refresh_count: int, ui_state: dict[str, Any]) -> DemoStep | None:
+    if not demo_mode:
+        return None
+
+    st.sidebar.divider()
+    st.sidebar.header("Demo Playback")
+    try:
+        timeline = load_demo_timeline(config.demo)
+    except DemoError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    step_count = len(timeline.steps)
+    st.session_state.setdefault("demo_index", 0)
+    st.session_state.setdefault("last_demo_refresh_count", refresh_count)
+    st.session_state.setdefault("demo_autoplay", bool(config.demo.autoplay))
+    st.session_state.setdefault("demo_show_ground_truth", bool(config.demo.show_ground_truth))
+    st.session_state.setdefault("demo_show_detector_evidence", bool(config.demo.show_detector_evidence))
+
+    autoplay = st.sidebar.toggle("Autoplay demo", key="demo_autoplay")
+    st.sidebar.toggle("Show ground truth", key="demo_show_ground_truth")
+    st.sidebar.toggle("Show detector evidence", key="demo_show_detector_evidence")
+
+    col_prev, col_next = st.sidebar.columns(2)
+    if col_prev.button("Previous frame"):
+        st.session_state.demo_index = (int(st.session_state.demo_index) - 1) % step_count
+        st.rerun()
+    if col_next.button("Next frame"):
+        st.session_state.demo_index = (int(st.session_state.demo_index) + 1) % step_count
+        st.rerun()
+    if st.sidebar.button("Reset demo"):
+        st.session_state.demo_index = 0
+        st.rerun()
+
+    if autoplay and ui_state["auto_refresh"] and refresh_count != st.session_state.last_demo_refresh_count:
+        st.session_state.demo_index = (int(st.session_state.demo_index) + 1) % step_count
+    st.session_state.last_demo_refresh_count = refresh_count
+
+    step = timeline.step_at(int(st.session_state.demo_index))
+    st.sidebar.caption(f"Frame {int(st.session_state.demo_index) + 1}/{step_count}: {step.label}")
+    return step
+
+
+def _load_zone_sets(config: AppConfig, demo_mode: bool) -> tuple[list[Zone], list[Zone], Path | None]:
+    zone_path = config.demo.seats_path if demo_mode else "config/seats.json"
+    fallback_path = config.demo.seats_path if demo_mode else "config/seats.example.json"
+    try:
+        monitor_result = load_zones(zone_path, fallback_path=fallback_path, include_disabled=False)
+        editor_result = load_zones(zone_path, fallback_path=fallback_path, include_disabled=True)
+    except ZoneConfigError as exc:
+        st.error(f"Zone configuration problem: {exc}")
+        return [], [], None
+
+    for warning in monitor_result.warnings:
+        st.warning(warning)
+    return list(monitor_result.zones), list(editor_result.zones), monitor_result.source_path
+
+
+def _get_frame(config: AppConfig, demo_mode: bool, demo_step: DemoStep | None) -> FrameResult:
+    if demo_mode and demo_step is not None:
+        try:
+            frame = load_demo_frame(demo_step, config.demo)
+            return FrameResult(frame=frame, ok=True, message=f"Demo frame: {demo_step.label}")
+        except DemoError as exc:
+            st.error(str(exc))
+            st.stop()
+    return _capture_manager(config).read_frame()
+
+
+def _monitor_tab(
+    config: AppConfig,
+    runtime_detection,
+    frame: np.ndarray,
+    frame_message: str,
+    zones: list[Zone],
+    demo_step: DemoStep | None,
+) -> None:
     if not zones:
         st.info("No enabled zones are configured yet. Open Zone Editor or run tools/zone_editor_cv.py.")
         st.image(Image.fromarray(frame), caption=frame_message, width="stretch")
         return
 
-    diff_detector = _diff_detector(runtime_detection)
-    yolo_detector = _yolo_detector(runtime_detection)
-    state_engine = _state_engine(runtime_detection)
-    store = _store(config)
+    if demo_step is not None:
+        st.info("Demo mode is using generated frames and injected demo evidence. This is not real AI detection.")
 
-    evidence_by_seat = diff_detector.analyze(frame, zones)
-    yolo_message = yolo_detector.status.message
-    if runtime_detection.yolo_enabled:
-        yolo_evidence = yolo_detector.detect(frame, zones)
-        evidence_by_seat = _merge_evidence(evidence_by_seat, yolo_evidence)
-
-    decisions = state_engine.update_all(zones, evidence_by_seat)
-    store.upsert_many(decisions.values())
-
+    decisions, evidence_by_seat, runtime = _run_analysis(config, runtime_detection, frame, zones, demo_step)
     status_map = {seat_id: decision.status for seat_id, decision in decisions.items()}
     overlay = draw_zones(frame, zones, status_map)
 
-    left, right = st.columns([1.75, 1], gap="large")
+    left, right = st.columns([1.7, 1], gap="large")
     with left:
         st.subheader("Camera Frame")
         st.image(overlay, caption=frame_message, width="stretch")
-        if diff_detector.warning:
-            st.warning(diff_detector.warning)
+        _runtime_metrics(runtime, runtime_detection, demo_step is not None)
+        if st.session_state.get("last_diff_warning"):
+            st.warning(st.session_state.last_diff_warning)
         if runtime_detection.yolo_enabled:
+            yolo_detector = _yolo_detector(runtime_detection)
             if yolo_detector.status.available:
-                st.success(yolo_message)
+                st.success(yolo_detector.status.message)
             else:
-                st.warning(yolo_message)
+                st.warning(yolo_detector.status.message)
         else:
-            st.info("YOLO correction is disabled. The app is using pixel-difference evidence only.")
+            st.info("YOLO correction is disabled. The app is using pixel-difference and/or demo evidence only.")
+
+        if demo_step is not None and st.session_state.get("demo_show_ground_truth", True):
+            st.subheader("Demo Ground Truth")
+            st.json(demo_step.expected_status, expanded=False)
+        if st.session_state.get("demo_show_detector_evidence", True):
+            with st.expander("Detector / demo evidence", expanded=False):
+                st.json({seat_id: evidence.__dict__ for seat_id, evidence in evidence_by_seat.items()}, expanded=False)
 
     with right:
         st.subheader("Seat Status")
@@ -142,7 +269,94 @@ def _monitor_tab(config, runtime_detection, frame: np.ndarray, frame_message: st
             _status_card(decision)
 
 
-def _status_card(decision) -> None:
+def _run_analysis(
+    config: AppConfig,
+    runtime_detection,
+    frame: np.ndarray,
+    zones: list[Zone],
+    demo_step: DemoStep | None,
+) -> tuple[dict[str, SeatDecision], dict[str, ZoneEvidence], RuntimeSnapshot]:
+    now = time.monotonic()
+    now_dt = datetime.now(UTC)
+    diff_gate = _interval_gate("diff", runtime_detection.diff_interval_seconds)
+    yolo_gate = _interval_gate("yolo", runtime_detection.yolo_interval_seconds)
+    store = _store(config)
+    state_engine = _state_engine(runtime_detection, store, config.storage.db_path)
+
+    diff_ran = False
+    if diff_gate.should_run(now) or "last_diff_evidence" not in st.session_state:
+        diff_detector = _diff_detector(runtime_detection)
+        diff_evidence = diff_detector.analyze(frame, zones)
+        st.session_state.last_diff_evidence = diff_evidence
+        st.session_state.last_diff_warning = diff_detector.warning
+        diff_gate.mark_run(now, now_dt)
+        diff_ran = True
+    else:
+        diff_evidence = st.session_state.get("last_diff_evidence", {})
+
+    yolo_ran = False
+    if runtime_detection.yolo_enabled:
+        yolo_detector = _yolo_detector(runtime_detection)
+        if yolo_gate.should_run(now) or "last_yolo_evidence" not in st.session_state:
+            yolo_evidence = yolo_detector.detect(frame, zones, force=True)
+            st.session_state.last_yolo_evidence = yolo_evidence
+            yolo_gate.mark_run(now, now_dt)
+            yolo_ran = True
+        else:
+            yolo_evidence = st.session_state.get("last_yolo_evidence", {})
+    else:
+        yolo_evidence = {}
+        st.session_state.last_yolo_evidence = {}
+
+    evidence_by_seat = _merge_evidence(diff_evidence, yolo_evidence)
+    demo_index = st.session_state.get("demo_index")
+    demo_changed = demo_step is not None and demo_index != st.session_state.get("last_demo_analysis_index")
+    if demo_step is not None:
+        demo_evidence = demo_evidence_for_step(demo_step)
+        evidence_by_seat = {**evidence_by_seat, **demo_evidence}
+
+    should_update_status = (
+        diff_ran
+        or yolo_ran
+        or demo_changed
+        or "last_decisions" not in st.session_state
+        or set(st.session_state.get("last_decisions", {}).keys()) != {zone.seat_id for zone in zones}
+    )
+    if should_update_status:
+        decisions = state_engine.update_all(zones, evidence_by_seat)
+        store.upsert_many(decisions.values())
+        st.session_state.last_decisions = decisions
+        st.session_state.last_evidence_by_seat = evidence_by_seat
+        st.session_state.last_demo_analysis_index = demo_index
+    else:
+        decisions = st.session_state.get("last_decisions", {})
+        evidence_by_seat = st.session_state.get("last_evidence_by_seat", evidence_by_seat)
+
+    runtime = RuntimeSnapshot(
+        diff_ran=diff_ran,
+        yolo_ran=yolo_ran,
+        last_diff_run=diff_gate.last_run_label,
+        last_yolo_run=yolo_gate.last_run_label,
+        next_diff_seconds=diff_gate.seconds_until_next(now),
+        next_yolo_seconds=yolo_gate.seconds_until_next(now),
+    )
+    return decisions, evidence_by_seat, runtime
+
+
+def _runtime_metrics(runtime: RuntimeSnapshot, runtime_detection, demo_mode: bool) -> None:
+    st.subheader("Analysis Timing")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Last diff run", runtime.last_diff_run, "ran now" if runtime.diff_ran else None)
+    col_b.metric("Next diff", f"{runtime.next_diff_seconds:.1f}s")
+    if runtime_detection.yolo_enabled:
+        col_c.metric("Last YOLO run", runtime.last_yolo_run, "ran now" if runtime.yolo_ran else None)
+        col_d.metric("Next YOLO", f"{runtime.next_yolo_seconds:.1f}s")
+    else:
+        col_c.metric("YOLO", "disabled")
+        col_d.metric("Mode", "demo" if demo_mode else "diff-only")
+
+
+def _status_card(decision: SeatDecision) -> None:
     color = STATUS_COLORS.get(decision.status, "#64748b")
     label = STATUS_SHORT_LABELS.get(decision.status, "Unknown")
     st.markdown(
@@ -164,11 +378,21 @@ def _status_card(decision) -> None:
     )
 
 
-def _zone_editor_tab(frame: np.ndarray, zones: list[Zone]) -> None:
+def _zone_editor_tab(config: AppConfig, frame: np.ndarray, zones: list[Zone], demo_mode: bool) -> None:
     st.subheader("Zone Editor")
-    st.write("Draw a polygon around one seat, enter a seat id/name, then save it to config/seats.json.")
+    if not zones:
+        st.warning("No zones are configured. Draw a polygon and save the first seat zone.")
+    st.write("Draw a polygon around one seat, enter a seat id/name, then save. Existing zones can be renamed, disabled, duplicated, or deleted below.")
 
-    display_image, scale_x, scale_y = _display_image_for_canvas(frame)
+    target_options = {
+        "Demo seats file": config.demo.seats_path,
+        "Normal config/seats.json": "config/seats.json",
+    }
+    default_index = 0 if demo_mode else 1
+    target_label = st.radio("Save target", list(target_options.keys()), index=default_index, horizontal=True)
+    target_path = target_options[target_label]
+
+    display_image, scale_x, scale_y = _display_image_for_canvas(_editor_background(config, frame))
 
     canvas_result = None
     try:
@@ -186,10 +410,7 @@ def _zone_editor_tab(frame: np.ndarray, zones: list[Zone]) -> None:
             key="zone_canvas",
         )
     except Exception as exc:
-        st.warning(
-            "Interactive Streamlit drawing is unavailable. Use the fallback command: "
-            "python tools/zone_editor_cv.py"
-        )
+        st.warning("Interactive Streamlit drawing is unavailable. Use the fallback command: python tools/zone_editor_cv.py")
         st.caption(f"Canvas detail: {exc}")
         st.image(draw_zones(frame, zones), width="stretch")
 
@@ -208,27 +429,72 @@ def _zone_editor_tab(frame: np.ndarray, zones: list[Zone]) -> None:
         else:
             updated = [zone for zone in zones if zone.seat_id != seat_id.strip()]
             updated.append(Zone(seat_id=seat_id.strip(), seat_name=seat_name.strip() or seat_id.strip(), polygon=tuple(polygon)))
-            target = save_zones(updated)
+            target = save_zones(updated, target_path)
             st.success(f"Saved {seat_id.strip()} to {target}")
             st.rerun()
 
-    if zones:
-        st.divider()
-        st.subheader("Existing Zones")
-        st.image(draw_zones(frame, zones), width="stretch")
-        delete_id = st.selectbox("Delete a zone", [zone.seat_id for zone in zones], index=None, placeholder="Choose a zone")
-        if st.button("Delete Selected Zone", disabled=not delete_id):
-            updated = [zone for zone in zones if zone.seat_id != delete_id]
-            save_zones(updated)
-            st.success(f"Deleted {delete_id}")
-            st.rerun()
+    st.divider()
+    st.subheader("Existing Zones")
+    st.image(draw_zones(frame, zones), width="stretch")
+    _existing_zone_editor(zones, target_path)
+    st.subheader("Zone JSON Preview")
+    st.json({"zones": [zone.to_json() for zone in zones]}, expanded=False)
 
 
-def _logs_tab(config) -> None:
+def _editor_background(config: AppConfig, frame: np.ndarray) -> np.ndarray:
+    choices = ["Current frame"]
+    latest = resolve_path("data/snapshots/latest.jpg", config.project_root)
+    if latest.exists():
+        choices.append("Latest snapshot")
+    if is_demo_mode(config):
+        choices.append("Demo mapping frame")
+    selected = st.selectbox("Editor background", choices)
+    if selected == "Latest snapshot":
+        return np.asarray(Image.open(latest).convert("RGB"))
+    if selected == "Demo mapping frame":
+        timeline = load_demo_timeline(config.demo)
+        return load_demo_frame(timeline.step_at(0), config.demo)
+    return frame
+
+
+def _existing_zone_editor(zones: list[Zone], target_path: str | Path) -> None:
+    if not zones:
+        return
+    selected_id = st.selectbox("Select a zone", [zone.seat_id for zone in zones])
+    selected = next(zone for zone in zones if zone.seat_id == selected_id)
+    st.code("\n".join(f"{index + 1}: ({x}, {y})" for index, (x, y) in enumerate(selected.polygon)))
+    st.caption(f"Polygon area: {polygon_area(selected.polygon):.0f} px")
+
+    with st.form("edit_existing_zone"):
+        new_name = st.text_input("Seat name", selected.seat_name)
+        enabled = st.checkbox("Enabled", selected.enabled)
+        action = st.radio("Action", ["Save changes", "Duplicate zone", "Delete zone"], horizontal=True)
+        submitted = st.form_submit_button("Apply")
+
+    if not submitted:
+        return
+    if action == "Delete zone":
+        updated = [zone for zone in zones if zone.seat_id != selected.seat_id]
+    elif action == "Duplicate zone":
+        copy_id = _copy_zone_id(zones, selected.seat_id)
+        offset_polygon = tuple((x + 20, y + 20) for x, y in selected.polygon)
+        updated = list(zones) + [
+            Zone(seat_id=copy_id, seat_name=f"{selected.seat_name} copy", polygon=offset_polygon, enabled=enabled)
+        ]
+    else:
+        updated = [
+            Zone(zone.seat_id, new_name if zone.seat_id == selected.seat_id else zone.seat_name, zone.polygon, enabled if zone.seat_id == selected.seat_id else zone.enabled)
+            for zone in zones
+        ]
+    save_zones(updated, target_path)
+    st.success(f"Updated {target_path}")
+    st.rerun()
+
+
+def _logs_tab(config: AppConfig) -> None:
     store = _store(config)
     st.subheader("Current Status")
-    current = store.get_current()
-    st.dataframe(current, width="stretch", hide_index=True)
+    st.dataframe(store.get_current(), width="stretch", hide_index=True)
 
     st.subheader("Status Change Log")
     st.dataframe(store.get_log(limit=200), width="stretch", hide_index=True)
@@ -238,43 +504,45 @@ def _logs_tab(config) -> None:
         st.rerun()
 
 
-def _settings_tab(config, runtime_detection) -> None:
+def _settings_tab(config: AppConfig, runtime_detection, ui_state: dict[str, Any], demo_mode: bool) -> None:
     st.subheader("Loaded Settings")
     st.code(
         f"""
 settings_path = {config.settings_path}
+demo_mode = {demo_mode}
 camera_source = {config.camera.source}
 mock_mode = {config.mock_mode}
 database = {config.storage.db_path}
+sqlite_timeout_seconds = {config.storage.timeout_seconds}
+sqlite_busy_timeout_ms = {config.storage.busy_timeout_ms}
+sqlite_wal_enabled = {config.storage.wal_enabled}
 save_snapshots = {config.privacy.save_snapshots}
+snapshot_interval_seconds = {config.privacy.snapshot_interval_seconds}
 
+auto_refresh_enabled = {ui_state["auto_refresh"]}
+refresh_interval_seconds = {ui_state["refresh_interval"]}
+diff_interval_seconds = {runtime_detection.diff_interval_seconds}
 yolo_enabled = {runtime_detection.yolo_enabled}
 yolo_interval_seconds = {runtime_detection.yolo_interval_seconds}
 yolo_model = {runtime_detection.yolo_model}
 object_occupancy_enabled = {runtime_detection.object_occupancy_enabled}
 object_conservativeness = {runtime_detection.object_conservativeness}
-required_object_hits = {_state_engine(runtime_detection).required_object_hits}
-object_conf_threshold = {_state_engine(runtime_detection).object_conf_threshold:.2f}
+required_object_hits = {_state_engine(runtime_detection, _store(config), config.storage.db_path).required_object_hits}
+object_conf_threshold = {_state_engine(runtime_detection, _store(config), config.storage.db_path).object_conf_threshold:.2f}
 """.strip()
     )
-    st.info(
-        "Privacy default: no raw video is saved. Status, evidence summaries, timestamps, and optional snapshots are stored locally."
-    )
+    st.info("Privacy default: no raw video is saved. Status, evidence summaries, timestamps, and optional throttled snapshots are stored locally.")
+    if config.camera.source == "picamera2":
+        st.warning("Multi-session note: capture resources are cached to reduce duplicate camera opens, but one dashboard operator is still recommended on Raspberry Pi.")
 
 
-def _capture(config) -> Any:
-    return _capture_manager(config).read_frame()
+@st.cache_resource
+def _cached_capture_manager(config: AppConfig) -> CaptureManager:
+    return CaptureManager(config)
 
 
-def _capture_manager(config) -> CaptureManager:
-    key = (config.camera.source, config.mock_mode, config.camera.mock_image_path, config.camera.device_index)
-    if st.session_state.get("capture_key") != key:
-        old_manager = st.session_state.get("capture_manager")
-        if old_manager is not None:
-            old_manager.close()
-        st.session_state.capture_key = key
-        st.session_state.capture_manager = CaptureManager(config)
-    return st.session_state.capture_manager
+def _capture_manager(config: AppConfig) -> CaptureManager:
+    return _cached_capture_manager(config)
 
 
 def _diff_detector(detection) -> DiffDetector:
@@ -282,6 +550,7 @@ def _diff_detector(detection) -> DiffDetector:
     if st.session_state.get("diff_key") != key:
         st.session_state.diff_key = key
         st.session_state.diff_detector = DiffDetector.from_config(detection)
+        st.session_state.pop("last_diff_evidence", None)
     return st.session_state.diff_detector
 
 
@@ -294,34 +563,56 @@ def _yolo_detector(detection) -> YoloDetector:
             model_name=detection.yolo_model,
             interval_seconds=detection.yolo_interval_seconds,
         )
+        st.session_state.pop("last_yolo_evidence", None)
     return st.session_state.yolo_detector
 
 
-def _state_engine(detection) -> SeatStateEngine:
+def _state_engine(detection, store: StatusStore, store_key: str) -> SeatStateEngine:
     key = (
         detection.object_occupancy_enabled,
         detection.object_conservativeness,
         detection.empty_required_hits,
         detection.person_required_hits,
+        store_key,
     )
     if st.session_state.get("state_key") != key:
         st.session_state.state_key = key
-        st.session_state.state_engine = SeatStateEngine.from_config(detection)
+        engine = SeatStateEngine.from_config(detection)
+        engine.restore_statuses(store.get_current())
+        st.session_state.state_engine = engine
+        st.session_state.pop("last_decisions", None)
     return st.session_state.state_engine
 
 
-def _store(config) -> StatusStore:
-    key = config.storage.db_path
+def _store(config: AppConfig) -> StatusStore:
+    key = (
+        config.storage.db_path,
+        config.storage.timeout_seconds,
+        config.storage.busy_timeout_ms,
+        config.storage.wal_enabled,
+    )
     if st.session_state.get("store_key") != key:
         st.session_state.store_key = key
-        st.session_state.store = StatusStore(config.storage.db_path)
+        st.session_state.store = StatusStore(
+            config.storage.db_path,
+            timeout_seconds=config.storage.timeout_seconds,
+            busy_timeout_ms=config.storage.busy_timeout_ms,
+            wal_enabled=config.storage.wal_enabled,
+        )
     return st.session_state.store
 
 
-def _merge_evidence(
-    base: dict[str, ZoneEvidence],
-    update: dict[str, ZoneEvidence],
-) -> dict[str, ZoneEvidence]:
+def _interval_gate(name: str, interval_seconds: int) -> IntervalGate:
+    key = f"{name}_gate_key"
+    gate_name = f"{name}_gate"
+    current_key = (int(interval_seconds),)
+    if st.session_state.get(key) != current_key:
+        st.session_state[key] = current_key
+        st.session_state[gate_name] = IntervalGate(interval_seconds=int(interval_seconds))
+    return st.session_state[gate_name]
+
+
+def _merge_evidence(base: dict[str, ZoneEvidence], update: dict[str, ZoneEvidence]) -> dict[str, ZoneEvidence]:
     merged = dict(base)
     for seat_id, evidence in update.items():
         merged[seat_id] = merged.get(seat_id, ZoneEvidence()).merge(evidence)
@@ -344,9 +635,7 @@ def _polygon_from_canvas(canvas_result: Any, scale_x: float, scale_y: float) -> 
     objects = canvas_result.json_data.get("objects", [])
     if not objects:
         return []
-
-    obj = objects[-1]
-    points = _extract_points(obj)
+    points = _extract_points(objects[-1])
     return [(int(round(x * scale_x)), int(round(y * scale_y))) for x, y in points]
 
 
@@ -360,20 +649,17 @@ def _extract_points(obj: dict) -> list[tuple[float, float]]:
         width = float(obj.get("width", 0) or 0) * scale_x
         height = float(obj.get("height", 0) or 0) * scale_y
         return [(left, top), (left + width, top), (left + width, top + height), (left, top + height)]
-
     if isinstance(obj.get("points"), list):
         return [
             (left + float(point.get("x", 0)) * scale_x, top + float(point.get("y", 0)) * scale_y)
             for point in obj["points"]
         ]
-
     if isinstance(obj.get("path"), list):
-        points = []
-        for command in obj["path"]:
-            if isinstance(command, list) and len(command) >= 3 and command[0] in {"M", "L"}:
-                points.append((left + float(command[1]) * scale_x, top + float(command[2]) * scale_y))
-        return points
-
+        return [
+            (left + float(command[1]) * scale_x, top + float(command[2]) * scale_y)
+            for command in obj["path"]
+            if isinstance(command, list) and len(command) >= 3 and command[0] in {"M", "L"}
+        ]
     return []
 
 
@@ -388,14 +674,7 @@ def _patch_drawable_canvas_image_helper() -> None:
     from streamlit.elements.lib.layout_utils import LayoutConfig
 
     def image_to_url_compat(image, width, clamp, channels, output_format, image_id):
-        return image_to_url(
-            image,
-            LayoutConfig(width=width),
-            clamp,
-            channels,
-            output_format,
-            image_id,
-        )
+        return image_to_url(image, LayoutConfig(width=width), clamp, channels, output_format, image_id)
 
     st_image.image_to_url = image_to_url_compat
 
@@ -408,9 +687,33 @@ def _next_seat_id(zones: list[Zone]) -> str:
     return f"seat_{index:03d}"
 
 
-def _ensure_runtime_dirs(config) -> None:
-    for relative in ("data", "data/snapshots", "config"):
+def _copy_zone_id(zones: list[Zone], base_id: str) -> str:
+    used = {zone.seat_id for zone in zones}
+    index = 1
+    while f"{base_id}_copy{index}" in used:
+        index += 1
+    return f"{base_id}_copy{index}"
+
+
+def _show_zone_warnings(zones: list[Zone], frame_shape: tuple[int, ...]) -> None:
+    for warning in validate_zones(zones, frame_shape):
+        if warning.severity == "error":
+            st.error(f"{warning.seat_id}: {warning.message}")
+        else:
+            st.warning(f"{warning.seat_id}: {warning.message}")
+
+
+def _ensure_runtime_dirs(config: AppConfig) -> None:
+    for relative in ("data", "data/snapshots", "config", "demo", "demo/frames"):
         resolve_path(relative, config.project_root).mkdir(parents=True, exist_ok=True)
+
+
+def _display_path(path: str | Path, root: Path) -> str:
+    path = Path(path)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
 
 
 if __name__ == "__main__":

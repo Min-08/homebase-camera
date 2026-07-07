@@ -8,6 +8,10 @@ if [[ ! -d ".venv" ]]; then
   echo ".venv was not found. Run ./setup_raspberry_pi.sh first."
   exit 1
 fi
+if [[ ! -f ".venv/bin/activate" ]]; then
+  echo ".venv exists but is not a Linux virtual environment. Run ./setup_raspberry_pi.sh or ./setup_pc.sh on this machine."
+  exit 1
+fi
 
 mkdir -p data data/snapshots config
 if [[ ! -f "config/settings.toml" && -f "config/settings.example.toml" ]]; then
@@ -19,8 +23,9 @@ fi
 
 source .venv/bin/activate
 export HOMEBASE_MOCK_MODE=1
+export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 echo "Starting Homebase Camera dashboard in mock mode..."
 echo "Open this on this computer: http://localhost:8501"
 
-python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+printf '\n' | python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --browser.gatherUsageStats false

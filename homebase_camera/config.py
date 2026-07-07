@@ -16,6 +16,12 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class UIConfig:
+    auto_refresh_enabled: bool = True
+    refresh_interval_seconds: int = 3
+
+
+@dataclass(frozen=True)
 class CameraConfig:
     source: str = "picamera2"
     device_index: int = 0
@@ -43,22 +49,39 @@ class DetectionConfig:
 @dataclass(frozen=True)
 class StorageConfig:
     db_path: str = "data/status.db"
+    timeout_seconds: int = 10
+    busy_timeout_ms: int = 5000
+    wal_enabled: bool = True
 
 
 @dataclass(frozen=True)
 class PrivacyConfig:
     save_raw_video: bool = False
     save_snapshots: bool = True
+    snapshot_interval_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class DemoConfig:
+    enabled: bool = False
+    timeline_path: str = "demo/demo_timeline.json"
+    seats_path: str = "demo/demo_seats.json"
+    assets_dir: str = "demo/frames"
+    autoplay: bool = True
+    show_ground_truth: bool = True
+    show_detector_evidence: bool = True
 
 
 @dataclass(frozen=True)
 class AppConfig:
     project_root: Path
     settings_path: Path
+    ui: UIConfig
     camera: CameraConfig
     detection: DetectionConfig
     storage: StorageConfig
     privacy: PrivacyConfig
+    demo: DemoConfig
     mock_mode: bool = False
     warnings: tuple[str, ...] = ()
 
@@ -75,7 +98,8 @@ def resolve_path(value: str | Path, root: Path | None = None) -> Path:
 
 def load_settings(path: str | Path | None = None) -> AppConfig:
     root = get_project_root()
-    requested_path = resolve_path(path, root) if path else root / "config" / "settings.toml"
+    env_path = os.getenv("HOMEBASE_SETTINGS_PATH")
+    requested_path = resolve_path(path or env_path, root) if (path or env_path) else root / "config" / "settings.toml"
     fallback_path = root / "config" / "settings.example.toml"
     warnings: list[str] = []
 
@@ -93,12 +117,17 @@ def load_settings(path: str | Path | None = None) -> AppConfig:
     else:
         warnings.append("No settings file found; using built-in defaults.")
 
+    ui = _build_dataclass(UIConfig(), data.get("app", {}), "app")
     camera = _build_dataclass(CameraConfig(), data.get("camera", {}), "camera")
     detection = _build_dataclass(DetectionConfig(), data.get("detection", {}), "detection")
     storage = _build_dataclass(StorageConfig(), data.get("storage", {}), "storage")
     privacy = _build_dataclass(PrivacyConfig(), data.get("privacy", {}), "privacy")
+    demo = _build_dataclass(DemoConfig(), data.get("demo", {}), "demo")
 
+    ui = _validate_ui(ui)
     detection = _validate_detection(detection)
+    storage = _validate_storage(storage)
+    privacy = _validate_privacy(privacy)
 
     source_override = os.getenv("HOMEBASE_CAMERA_SOURCE")
     if source_override:
@@ -107,14 +136,21 @@ def load_settings(path: str | Path | None = None) -> AppConfig:
     mock_mode = os.getenv("HOMEBASE_MOCK_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     if mock_mode:
         camera = replace(camera, source="mock")
+    demo_mode = os.getenv("HOMEBASE_DEMO_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if demo_mode:
+        demo = replace(demo, enabled=True)
+        camera = replace(camera, source="demo")
+        detection = replace(detection, yolo_enabled=False)
 
     return AppConfig(
         project_root=root,
         settings_path=settings_path,
+        ui=ui,
         camera=camera,
         detection=detection,
         storage=storage,
         privacy=privacy,
+        demo=demo,
         mock_mode=mock_mode or camera.source == "mock",
         warnings=tuple(warnings),
     )
@@ -152,6 +188,30 @@ def _validate_detection(config: DetectionConfig) -> DetectionConfig:
         raise ConfigError("change_ratio_threshold must be greater than 0 and less than or equal to 1.")
 
     return replace(config, object_conservativeness=conservativeness)
+
+
+def _validate_ui(config: UIConfig) -> UIConfig:
+    if int(config.refresh_interval_seconds) < 1:
+        raise ConfigError("refresh_interval_seconds must be at least 1.")
+    return replace(config, refresh_interval_seconds=int(config.refresh_interval_seconds))
+
+
+def _validate_storage(config: StorageConfig) -> StorageConfig:
+    if int(config.timeout_seconds) < 1:
+        raise ConfigError("timeout_seconds must be at least 1.")
+    if int(config.busy_timeout_ms) < 100:
+        raise ConfigError("busy_timeout_ms must be at least 100.")
+    return replace(
+        config,
+        timeout_seconds=int(config.timeout_seconds),
+        busy_timeout_ms=int(config.busy_timeout_ms),
+    )
+
+
+def _validate_privacy(config: PrivacyConfig) -> PrivacyConfig:
+    if int(config.snapshot_interval_seconds) < 1:
+        raise ConfigError("snapshot_interval_seconds must be at least 1.")
+    return replace(config, snapshot_interval_seconds=int(config.snapshot_interval_seconds))
 
 
 def _display_path(path: Path, root: Path) -> str:

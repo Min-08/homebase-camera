@@ -1,8 +1,10 @@
 # Homebase Camera
 
-Raspberry Pi 4B prototype for local, camera-based homebase seat occupancy detection. It uses one OV5647-style normal field-of-view camera, polygon seat zones, pixel-difference detection, optional periodic YOLO correction, SQLite status logging, and a Streamlit dashboard.
+Raspberry Pi 4B prototype for local, camera-based homebase seat occupancy detection. It uses one normal OV5647-style camera, polygon seat zones, pixel-difference detection, optional periodic YOLO correction, SQLite status logging, and a Streamlit dashboard.
 
-The system does not perform face recognition or personal identification. It only publishes seat state:
+The project also includes a first-class PC demo mode. Demo mode uses generated frames and synthetic ground-truth evidence so the full `0/1/2` workflow can be shown without Raspberry Pi hardware, a physical camera, Picamera2, or YOLO.
+
+Status codes:
 
 ```text
 0 = empty / available
@@ -10,9 +12,9 @@ The system does not perform face recognition or personal identification. It only
 2 = temporarily left / object occupancy
 ```
 
-## Raspberry Pi Quick Start
+This system does not perform face recognition or personal identification.
 
-Clone the repository on the Raspberry Pi, then run the setup script once and the launcher whenever you want to start the dashboard:
+## Raspberry Pi Real Camera Quick Start
 
 ```bash
 git clone https://github.com/Min-08/homebase-camera.git
@@ -26,77 +28,61 @@ Open the dashboard on the Raspberry Pi at `http://localhost:8501`. From another 
 
 If you copied the folder manually instead of using `git clone`, open a terminal in the copied `homebase-camera` folder and run the same commands.
 
-No camera hardware available yet:
+## PC Demo Quick Start
+
+PC demo mode is for presentation, development, and mapping practice. It is not a claim of real detection accuracy. It uses generated demo frames and demo evidence.
+
+### Windows PC
+
+```bat
+git clone https://github.com/Min-08/homebase-camera.git
+cd homebase-camera
+setup_pc.bat
+run_demo.bat
+```
+
+### macOS / Linux PC
 
 ```bash
-./run_mock.sh
+git clone https://github.com/Min-08/homebase-camera.git
+cd homebase-camera
+chmod +x setup_pc.sh run_demo.sh run_mock.sh
+./setup_pc.sh
+./run_demo.sh
 ```
 
-## Target Hardware
+PC demo mode does not require Picamera2, Raspberry Pi hardware, a camera, or Ultralytics YOLO.
 
-- Raspberry Pi 4 Model B, 8 GB RAM recommended
-- One OV5647 camera module
-- Normal camera field of view, approximately 60 +/- 5 degrees
-- Raspberry Pi OS with Python 3.10 or newer
+## Running Modes
 
-The prototype supports any number of configured zones, but the physical number of seats covered depends on camera placement, height, and lens field of view.
-
-## Architecture
-
-```text
-[OV5647 camera / mock image]
-        |
-[Picamera2 or fallback capture]
-        |
-[Dynamic polygon zones from config/seats.json]
-        |
-[Pixel difference detector]
-        |
-[Optional periodic YOLO correction]
-        |
-[State smoothing and conservative decision logic]
-        |
-[SQLite current_status + status_log]
-        |
-[Streamlit dashboard + zone editor]
-```
-
-Pixel difference is the primary lightweight detector. YOLO is optional and runs only periodically by default, because Raspberry Pi 4B is not a good target for continuous real-time YOLO inference.
-
-## Installation Details
-
-The setup script creates `.venv`, installs Python dependencies, creates `data/`, `data/snapshots/`, and `config/`, and copies examples to user-editable files if missing:
-
-- `config/settings.example.toml` -> `config/settings.toml`
-- `config/seats.example.json` -> `config/seats.json`
-
-It is safe to run repeatedly. It does not overwrite existing settings, zones, snapshots, or logs.
-
-Picamera2 is usually installed through Raspberry Pi OS packages, not pip:
-
-```bash
-sudo apt update
-sudo apt install python3-picamera2 python3-opencv
-```
-
-Then rerun:
-
-```bash
-./setup_raspberry_pi.sh
-```
-
-## Running
-
-Normal Raspberry Pi launch:
+Real Raspberry Pi mode:
 
 ```bash
 ./run_app.sh
 ```
 
-Development/mock launch without camera hardware:
+PC demo mode:
+
+```bash
+./run_demo.sh
+```
+
+Windows PC demo:
+
+```bat
+run_demo.bat
+```
+
+Mock mode without camera hardware:
 
 ```bash
 ./run_mock.sh
+```
+
+Windows mock mode:
+
+```bat
+run_mock.bat
 ```
 
 Advanced manual launch after dependencies are installed:
@@ -105,27 +91,101 @@ Advanced manual launch after dependencies are installed:
 python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-## Baseline Image
+## Architecture
 
-The pixel-difference detector compares the current frame with a baseline/reference image.
-
-Capture a baseline from the configured camera:
-
-```bash
-python tools/capture_baseline.py
+```text
+[OV5647 camera / generated demo frame / mock image]
+        |
+[Picamera2, OpenCV, or demo capture]
+        |
+[Dynamic polygon zones from seats JSON]
+        |
+[Interval-gated pixel difference detector]
+        |
+[Optional interval-gated YOLO correction]
+        |
+[Demo evidence injection in PC demo mode]
+        |
+[State smoothing and conservative decision logic]
+        |
+[SQLite current_status + status_log]
+        |
+[Streamlit dashboard + zone editor]
 ```
 
-Capture a mock baseline for development:
+## Auto-Refresh and Intervals
 
-```bash
-python tools/capture_baseline.py --mock
+The sidebar has:
+
+- Auto-refresh toggle
+- Refresh interval slider
+- Manual refresh button
+- YOLO enabled/disabled
+- Object occupancy enabled/disabled
+- Object conservativeness slider
+
+Config defaults:
+
+```toml
+[app]
+auto_refresh_enabled = true
+refresh_interval_seconds = 3
+
+[detection]
+diff_interval_seconds = 3
+yolo_interval_seconds = 20
 ```
 
-The default baseline path is `data/snapshots/baseline.jpg`. If no baseline exists, the app uses the first frame as a temporary baseline and shows a warning.
+The dashboard reruns at the refresh interval, but detector work is separately gated:
 
-## Configuring Seat Zones
+- `diff_interval_seconds` controls when pixel-diff analysis runs.
+- `yolo_interval_seconds` controls when YOLO analysis runs.
+- If a detector is not due yet, the app reuses the last evidence/status instead of advancing smoothing on every rerun.
+- The monitor shows last diff run time and last YOLO run time.
 
-Zones are polygons loaded from `config/seats.json`. Disabled zones are ignored. Example:
+## PC Mapping Demo
+
+Use PC demo mode and open the `Zone Editor` tab:
+
+```bash
+./run_demo.sh
+```
+
+or on Windows:
+
+```bat
+run_demo.bat
+```
+
+In the editor you can:
+
+- Draw a polygon over the demo frame
+- Save to the demo seats file or normal `config/seats.json`
+- Rename existing zones
+- Enable/disable zones
+- Delete zones
+- Duplicate zones
+- View the coordinate list
+- View polygon area
+- Preview the zone JSON
+
+The app warns about missing zones, polygons with fewer than 3 points, very small polygons, out-of-bounds coordinates, and heavy zone overlap.
+
+## Zone Files
+
+Real mode uses:
+
+```text
+config/seats.json
+```
+
+PC demo mode uses:
+
+```text
+demo/demo_seats.json
+```
+
+Example structure:
 
 ```json
 {
@@ -140,47 +200,50 @@ Zones are polygons loaded from `config/seats.json`. Disabled zones are ignored. 
 }
 ```
 
-Use the dashboard `Zone Editor` tab to draw and save zones. If the browser canvas component is unavailable, use the fallback OpenCV editor:
+You can regenerate demo frames, demo seats, and the demo timeline:
 
 ```bash
-python tools/zone_editor_cv.py
+python tools/generate_demo_assets.py
 ```
 
-Mock editor mode:
+## Baseline Image
+
+The pixel-difference detector compares the current frame with a baseline/reference image.
+
+Capture a baseline from the configured camera:
 
 ```bash
-python tools/zone_editor_cv.py --mock
+python tools/capture_baseline.py
 ```
 
-In the OpenCV editor, click polygon points around a seat, press `f` to finish/save, `u` to undo a point, `r` to reset points, and `q` to quit.
+Capture a mock baseline:
 
-## Detection Settings
-
-Edit `config/settings.toml` after setup. Important defaults:
-
-```toml
-[detection]
-diff_interval_seconds = 3
-yolo_enabled = true
-yolo_interval_seconds = 20
-yolo_model = "yolov8n.pt"
-object_occupancy_enabled = true
-object_conservativeness = 5
-empty_required_hits = 2
-person_required_hits = 1
+```bash
+python tools/capture_baseline.py --mock
 ```
 
-`object_occupancy_enabled` controls whether the public dashboard can output status `2`. If false, object-only evidence never publishes status `2`.
+If no baseline exists, the app uses the first frame as a temporary baseline and shows a warning.
 
-`object_conservativeness` is an integer from 0 to 10:
+## Raspberry Pi Camera Troubleshooting
 
-- `0`: status `2` can trigger quickly
-- `5`: balanced default
-- `10`: requires persistent, high-confidence object evidence
+Install camera dependencies on Raspberry Pi OS:
 
-Internally, higher conservativeness increases both the required repeated object hits and the object confidence threshold.
+```bash
+sudo apt update
+sudo apt install python3-picamera2 python3-opencv
+./setup_raspberry_pi.sh
+```
 
-## YOLO Notes
+If the camera is not detected:
+
+- Check the ribbon cable orientation and connector latch.
+- Reboot after connecting the camera.
+- Confirm the camera works with Raspberry Pi OS camera tools.
+- Use `./run_mock.sh` or `./run_demo.sh` to verify the app without hardware.
+
+Multi-session note: capture resources are cached to reduce duplicate camera opens, but one dashboard operator is still recommended on Raspberry Pi.
+
+## YOLO Notes and License Caution
 
 YOLO correction is optional. If `ultralytics` or the model is missing, the app continues in diff-only mode and shows a warning.
 
@@ -191,68 +254,49 @@ source .venv/bin/activate
 pip install ultralytics
 ```
 
-The default interval is 20 seconds. Increase `yolo_interval_seconds` on Raspberry Pi if the dashboard becomes slow.
+Increase `yolo_interval_seconds` if Raspberry Pi performance is slow.
 
-License note: the Ultralytics Python package and common YOLOv8 models have AGPL-related licensing considerations. For school prototypes this may be acceptable, but check the license before using it in a closed or commercial deployment.
+License note: the Ultralytics Python package and common YOLOv8 models have AGPL-related licensing considerations. Check the license before closed or commercial use.
 
-## SQLite Storage
+## SQLite and Snapshot Robustness
 
-The local database path is `data/status.db`. Tables:
+SQLite uses a timeout, `busy_timeout`, and WAL mode by default:
 
-- `current_status`: latest status per seat
-- `status_log`: appended status changes
+```toml
+[storage]
+db_path = "data/status.db"
+timeout_seconds = 10
+busy_timeout_ms = 5000
+wal_enabled = true
+```
 
-The dashboard `Logs` tab displays both tables and can clear the log. The app avoids logging every frame when the status did not change.
+Latest snapshot writes are throttled to reduce SD card writes:
+
+```toml
+[privacy]
+save_snapshots = true
+snapshot_interval_seconds = 30
+```
+
+Set `save_snapshots = false` to avoid snapshot writes.
 
 ## Privacy and Safety
 
 - No face recognition
 - No personal identification
 - No raw video recording by default
-- Local-only SQLite status data by default
-- Optional snapshots can be disabled with `save_snapshots = false`
+- Local SQLite status data
+- Optional snapshots can be disabled
 
 For real shared spaces, use high-angle/top-view placement where possible and post a clear camera notice.
 
-## Troubleshooting
+## Known Limitations
 
-Missing Picamera2:
-
-```bash
-sudo apt install python3-picamera2
-./setup_raspberry_pi.sh
-```
-
-Camera not detected:
-
-- Check the ribbon cable orientation and connector latch.
-- Reboot after connecting the camera.
-- Confirm the camera works with Raspberry Pi OS camera tools.
-- Run `./run_mock.sh` to verify the app without hardware.
-
-OpenCV fallback/editor missing:
-
-```bash
-sudo apt install python3-opencv
-```
-
-YOLO model missing or slow:
-
-- The app still runs in diff-only mode.
-- Install with `pip install ultralytics` only if needed.
-- Increase `yolo_interval_seconds` in `config/settings.toml`.
-
-Streamlit port already in use:
-
-```bash
-python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8502
-```
-
-Bad zone JSON:
-
-- Open the dashboard and check the error message.
-- Restore from `config/seats.example.json`.
-- Use `python tools/zone_editor_cv.py --mock` to create a fresh zone file.
+- Demo mode uses generated frames and synthetic evidence; it is for presentation and mapping practice.
+- Pixel difference is sensitive to lighting and camera movement.
+- YOLO on Raspberry Pi 4B can be slow; use long intervals.
+- State smoothing history is restored from the latest SQLite status, but hit counters are still approximate after restart.
+- Multi-session camera safety is improved with a cached resource, but Raspberry Pi camera hardware is still best used from one dashboard session at a time.
 
 ## Development
 
@@ -260,6 +304,8 @@ Run tests without Raspberry Pi hardware or YOLO:
 
 ```bash
 python -m pytest
+python -m compileall app.py homebase_camera tools tests
+bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh
 ```
 
-The tests cover zone loading/validation, polygon masks, state smoothing and object conservativeness, and SQLite insert/update behavior.
+Windows batch files are provided for users, but should be tested on Windows before relying on a classroom presentation machine.
