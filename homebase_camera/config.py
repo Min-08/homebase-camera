@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only used on older Python
+    import tomli as tomllib  # type: ignore
+
+
+class ConfigError(ValueError):
+    """Raised when settings are malformed."""
+
+
+@dataclass(frozen=True)
+class CameraConfig:
+    source: str = "picamera2"
+    device_index: int = 0
+    mock_image_path: str = "data/snapshots/mock.jpg"
+    mock_video_path: str = ""
+    frame_width: int = 1280
+    frame_height: int = 720
+
+
+@dataclass(frozen=True)
+class DetectionConfig:
+    diff_interval_seconds: int = 3
+    yolo_enabled: bool = True
+    yolo_interval_seconds: int = 20
+    yolo_model: str = "yolov8n.pt"
+    object_occupancy_enabled: bool = True
+    object_conservativeness: int = 5
+    empty_required_hits: int = 2
+    person_required_hits: int = 1
+    diff_threshold: int = 30
+    change_ratio_threshold: float = 0.04
+    baseline_path: str = "data/snapshots/baseline.jpg"
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    db_path: str = "data/status.db"
+
+
+@dataclass(frozen=True)
+class PrivacyConfig:
+    save_raw_video: bool = False
+    save_snapshots: bool = True
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    project_root: Path
+    settings_path: Path
+    camera: CameraConfig
+    detection: DetectionConfig
+    storage: StorageConfig
+    privacy: PrivacyConfig
+    mock_mode: bool = False
+    warnings: tuple[str, ...] = ()
+
+
+def get_project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_path(value: str | Path, root: Path | None = None) -> Path:
+    root = root or get_project_root()
+    path = Path(value)
+    return path if path.is_absolute() else root / path
+
+
+def load_settings(path: str | Path | None = None) -> AppConfig:
+    root = get_project_root()
+    requested_path = resolve_path(path, root) if path else root / "config" / "settings.toml"
+    fallback_path = root / "config" / "settings.example.toml"
+    warnings: list[str] = []
+
+    settings_path = requested_path
+    if not settings_path.exists():
+        settings_path = fallback_path
+        warnings.append(
+            f"{_display_path(requested_path, root)} was not found; using config/settings.example.toml."
+        )
+
+    data: dict[str, Any] = {}
+    if settings_path.exists():
+        with settings_path.open("rb") as handle:
+            data = tomllib.load(handle)
+    else:
+        warnings.append("No settings file found; using built-in defaults.")
+
+    camera = _build_dataclass(CameraConfig(), data.get("camera", {}), "camera")
+    detection = _build_dataclass(DetectionConfig(), data.get("detection", {}), "detection")
+    storage = _build_dataclass(StorageConfig(), data.get("storage", {}), "storage")
+    privacy = _build_dataclass(PrivacyConfig(), data.get("privacy", {}), "privacy")
+
+    detection = _validate_detection(detection)
+
+    source_override = os.getenv("HOMEBASE_CAMERA_SOURCE")
+    if source_override:
+        camera = replace(camera, source=source_override)
+
+    mock_mode = os.getenv("HOMEBASE_MOCK_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if mock_mode:
+        camera = replace(camera, source="mock")
+
+    return AppConfig(
+        project_root=root,
+        settings_path=settings_path,
+        camera=camera,
+        detection=detection,
+        storage=storage,
+        privacy=privacy,
+        mock_mode=mock_mode or camera.source == "mock",
+        warnings=tuple(warnings),
+    )
+
+
+def _build_dataclass(default_obj: Any, section: dict[str, Any], section_name: str) -> Any:
+    if not isinstance(section, dict):
+        raise ConfigError(f"[{section_name}] must be a TOML table.")
+
+    allowed = set(default_obj.__dataclass_fields__.keys())
+    values = {}
+    for key, value in section.items():
+        if key not in allowed:
+            raise ConfigError(f"Unknown setting [{section_name}].{key}")
+        values[key] = value
+    return replace(default_obj, **values)
+
+
+def _validate_detection(config: DetectionConfig) -> DetectionConfig:
+    try:
+        conservativeness = int(config.object_conservativeness)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("object_conservativeness must be an integer from 0 to 10.") from exc
+
+    if not 0 <= conservativeness <= 10:
+        raise ConfigError("object_conservativeness must be between 0 and 10.")
+
+    if config.yolo_interval_seconds < 1:
+        raise ConfigError("yolo_interval_seconds must be at least 1.")
+    if config.diff_interval_seconds < 1:
+        raise ConfigError("diff_interval_seconds must be at least 1.")
+    if config.empty_required_hits < 1 or config.person_required_hits < 1:
+        raise ConfigError("empty_required_hits and person_required_hits must be at least 1.")
+    if not 0 < float(config.change_ratio_threshold) <= 1:
+        raise ConfigError("change_ratio_threshold must be greater than 0 and less than or equal to 1.")
+
+    return replace(config, object_conservativeness=conservativeness)
+
+
+def _display_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)

@@ -1,0 +1,27 @@
+[camera]
+source = "picamera2"
+device_index = 0
+mock_image_path = "data/snapshots/mock.jpg"
+mock_video_path = ""
+frame_width = 1280
+frame_height = 720
+
+[detection]
+diff_interval_seconds = 3
+yolo_enabled = true
+yolo_interval_seconds = 20
+yolo_model = "yolov8n.pt"
+object_occupancy_enabled = true
+object_conservativeness = 5
+empty_required_hits = 2
+person_required_hits = 1
+diff_threshold = 30
+change_ratio_threshold = 0.04
+baseline_path = "data/snapshots/baseline.jpg"
+
+[storage]
+db_path = "data/status.db"
+
+[privacy]
+save_raw_video = false
+save_snapshots = true

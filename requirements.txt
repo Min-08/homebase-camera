@@ -1,0 +1,11 @@
+streamlit>=1.31
+streamlit-drawable-canvas>=0.9.3
+numpy>=1.24
+pillow>=10.0
+tomli>=2.0; python_version < "3.11"
+pytest>=7.4
+
+# Optional:
+# - Picamera2 is installed through apt on Raspberry Pi OS: sudo apt install python3-picamera2
+# - OpenCV fallback/editor: sudo apt install python3-opencv, or pip install opencv-python-headless
+# - YOLO correction: pip install ultralytics

@@ -1,0 +1,22 @@
+{
+  "zones": [
+    {
+      "seat_id": "seat_001",
+      "seat_name": "Seat 1",
+      "polygon": [[120, 220], [360, 220], [365, 430], [110, 430]],
+      "enabled": true
+    },
+    {
+      "seat_id": "seat_002",
+      "seat_name": "Seat 2",
+      "polygon": [[430, 220], [670, 220], [675, 430], [420, 430]],
+      "enabled": true
+    },
+    {
+      "seat_id": "seat_003",
+      "seat_name": "Seat 3",
+      "polygon": [[740, 220], [980, 220], [985, 430], [730, 430]],
+      "enabled": true
+    }
+  ]
+}
