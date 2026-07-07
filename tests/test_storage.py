@@ -46,3 +46,23 @@ def test_storage_initializes_busy_timeout_and_wal(tmp_path):
 
     assert pragmas["busy_timeout"] == 4321
     assert str(pragmas["journal_mode"]).lower() == "wal"
+
+
+def test_storage_does_not_reapply_wal_on_regular_connections(tmp_path, monkeypatch):
+    store = StatusStore(tmp_path / "status.db", wal_enabled=True)
+    journal_configurations = 0
+    original_configure = store._configure_connection
+
+    def tracking_configure(conn, *, configure_journal=False):
+        nonlocal journal_configurations
+        if configure_journal:
+            journal_configurations += 1
+        return original_configure(conn, configure_journal=configure_journal)
+
+    monkeypatch.setattr(store, "_configure_connection", tracking_configure)
+
+    store.get_current()
+    store.upsert(_decision(STATUS_PERSON))
+    store.get_log()
+
+    assert journal_configurations == 0

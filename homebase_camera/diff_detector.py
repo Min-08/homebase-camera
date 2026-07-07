@@ -37,16 +37,31 @@ class DiffDetector:
         baseline = self._get_baseline(frame)
         if baseline is None:
             self._baseline = frame.copy()
-            self.warning = (
+            baseline_problem = self.warning
+            fallback_warning = (
                 "No baseline image found. The current frame is being used as a temporary baseline. "
                 "Run tools/capture_baseline.py for a stable setup."
             )
+            if baseline_problem:
+                fallback_warning = (
+                    f"{baseline_problem} The current frame is being used as a temporary baseline. "
+                    "Run tools/capture_baseline.py to replace the baseline."
+                )
+            self.warning = fallback_warning
             return {
                 zone.seat_id: ZoneEvidence(message="temporary baseline initialized")
                 for zone in zones
             }
 
         current_gray = _to_gray(frame)
+        if baseline.shape[:2] != frame.shape[:2]:
+            self.warning = (
+                f"Baseline resolution {baseline.shape[1]}x{baseline.shape[0]} does not match "
+                f"current frame {frame.shape[1]}x{frame.shape[0]}; resizing baseline for this analysis. "
+                "Capture a new baseline after changing camera resolution or source."
+            )
+        else:
+            self.warning = None
         baseline_gray = _to_gray(_resize_to_match(baseline, frame))
         diff = np.abs(current_gray.astype(np.int16) - baseline_gray.astype(np.int16)).astype(np.uint8)
         changed = diff > self.diff_threshold

@@ -48,9 +48,11 @@ class StatusStore:
         self.init_db()
 
     def init_db(self) -> None:
-        with self._connect() as conn:
-            self._configure_connection(conn)
-            conn.executescript(SCHEMA)
+        self._write_with_retry(self._init_db)
+
+    def _init_db(self, conn: sqlite3.Connection) -> None:
+        self._configure_connection(conn, configure_journal=True)
+        conn.executescript(SCHEMA)
 
     def upsert_many(self, decisions: Iterable[SeatDecision]) -> None:
         self._write_with_retry(lambda conn: [self._upsert(conn, decision) for decision in decisions])
@@ -119,9 +121,9 @@ class StatusStore:
         self._configure_connection(conn)
         return conn
 
-    def _configure_connection(self, conn: sqlite3.Connection) -> None:
+    def _configure_connection(self, conn: sqlite3.Connection, *, configure_journal: bool = False) -> None:
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-        if self.wal_enabled:
+        if self.wal_enabled and configure_journal:
             conn.execute("PRAGMA journal_mode = WAL")
 
     def _write_with_retry(self, callback) -> None:

@@ -28,9 +28,17 @@ Open the dashboard on the Raspberry Pi at `http://localhost:8501`. From another 
 
 If you copied the folder manually instead of using `git clone`, open a terminal in the copied `homebase-camera` folder and run the same commands.
 
+To also install Raspberry Pi OS camera/system packages during setup, run:
+
+```bash
+./setup_raspberry_pi.sh --install-system-packages
+```
+
 ## PC Demo Quick Start
 
 PC demo mode is for presentation, development, and mapping practice. It is not a claim of real detection accuracy. It uses generated demo frames and demo evidence.
+
+Use a standard CPython 3 installation. Experimental free-threaded CPython builds are rejected by the setup scripts because some required packages may not publish compatible wheels.
 
 ### Windows PC
 
@@ -206,6 +214,13 @@ You can regenerate demo frames, demo seats, and the demo timeline:
 python tools/generate_demo_assets.py
 ```
 
+By default this creates only missing demo assets and preserves user-edited `demo/demo_seats.json`, `demo/demo_timeline.json`, and existing files under `demo/frames/`.
+To intentionally reset the demo assets to the built-in defaults:
+
+```bash
+python tools/generate_demo_assets.py --force
+```
+
 ## Baseline Image
 
 The pixel-difference detector compares the current frame with a baseline/reference image.
@@ -306,6 +321,8 @@ Run tests without Raspberry Pi hardware or YOLO:
 python -m pytest
 python -m compileall app.py homebase_camera tools tests
 bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh
+python tools/generate_demo_assets.py
+python tools/generate_demo_assets.py --force
 ```
 
 Windows batch files are provided for users, but should be tested on Windows before relying on a classroom presentation machine.

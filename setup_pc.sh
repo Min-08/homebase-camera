@@ -14,6 +14,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! python3 -c "import sysconfig; raise SystemExit(1 if sysconfig.get_config_var('Py_GIL_DISABLED') else 0)" >/dev/null 2>&1; then
+  echo "Homebase Camera PC setup requires standard CPython, not the free-threaded CPython build."
+  echo "Install the normal Python 3 release, remove .venv if it exists, and run ./setup_pc.sh again."
+  exit 1
+fi
+
 mkdir -p data data/snapshots config demo demo/frames
 
 if [[ ! -d ".venv" ]]; then
@@ -22,6 +28,12 @@ fi
 if [[ ! -f ".venv/bin/activate" ]]; then
   echo ".venv exists but is not a macOS/Linux virtual environment."
   echo "Remove .venv and run ./setup_pc.sh again, or use setup_pc.bat on Windows."
+  exit 1
+fi
+
+if ! .venv/bin/python -c "import sysconfig; raise SystemExit(1 if sysconfig.get_config_var('Py_GIL_DISABLED') else 0)" >/dev/null 2>&1; then
+  echo ".venv uses free-threaded CPython, which lacks wheels for required packages."
+  echo "Remove .venv, install standard CPython, and run ./setup_pc.sh again."
   exit 1
 fi
 

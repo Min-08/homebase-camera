@@ -6,6 +6,10 @@ if not exist .venv (
   echo .venv was not found. Run setup_pc.bat first.
   exit /b 1
 )
+if not exist .venv\Scripts\activate.bat (
+  echo .venv exists but is not a Windows virtual environment. Run setup_pc.bat on this machine.
+  exit /b 1
+)
 
 call .venv\Scripts\activate.bat
 python tools\generate_demo_assets.py >nul

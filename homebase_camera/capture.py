@@ -120,6 +120,7 @@ class CaptureManager:
             frame = self._picamera.capture_array()
             return FrameResult(frame=_ensure_rgb(frame), ok=True, message="Picamera2 frame captured.")
         except Exception as exc:
+            self._reset_picamera()
             return FrameResult(
                 frame=np.empty((1, 1, 3), dtype=np.uint8),
                 ok=False,
@@ -144,10 +145,12 @@ class CaptureManager:
                 self._cv_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_config.frame_height)
             ok, frame = self._cv_capture.read()
             if not ok or frame is None:
+                self._reset_opencv()
                 return FrameResult(frame=np.empty((1, 1, 3), dtype=np.uint8), ok=False, message="OpenCV could not read a frame.")
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             return FrameResult(frame=frame, ok=True, message="OpenCV frame captured.")
         except Exception as exc:
+            self._reset_opencv()
             return FrameResult(frame=np.empty((1, 1, 3), dtype=np.uint8), ok=False, message=f"OpenCV capture failed: {exc}")
 
     def _placeholder(self, message: str, *, ok: bool = False) -> FrameResult:
@@ -156,6 +159,24 @@ class CaptureManager:
             ok=ok,
             message=message,
         )
+
+    def _reset_picamera(self) -> None:
+        if self._picamera is None:
+            return
+        try:
+            self._picamera.stop()
+        except Exception:
+            pass
+        self._picamera = None
+
+    def _reset_opencv(self) -> None:
+        if self._cv_capture is None:
+            return
+        try:
+            self._cv_capture.release()
+        except Exception:
+            pass
+        self._cv_capture = None
 
 
 def _ensure_rgb(frame: np.ndarray) -> np.ndarray:

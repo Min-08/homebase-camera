@@ -49,6 +49,14 @@ def test_load_zones_rejects_malformed_polygon(tmp_path):
         load_zones(path)
 
 
+def test_load_zones_reports_checked_paths_when_missing(tmp_path):
+    requested = tmp_path / "missing_seats.json"
+    fallback = tmp_path / "missing_example.json"
+
+    with pytest.raises(ZoneConfigError, match="No usable zone file was found"):
+        load_zones(requested, fallback_path=fallback)
+
+
 def test_polygon_mask_and_point_in_polygon():
     polygon = [(2, 2), (8, 2), (8, 8), (2, 8)]
 

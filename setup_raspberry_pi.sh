@@ -9,9 +9,44 @@ if [[ ! -f "app.py" || ! -f "requirements.txt" ]]; then
   exit 1
 fi
 
+INSTALL_SYSTEM_PACKAGES=0
+for arg in "$@"; do
+  case "$arg" in
+    --install-system-packages)
+      INSTALL_SYSTEM_PACKAGES=1
+      ;;
+    -h|--help)
+      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages]"
+      echo ""
+      echo "  --install-system-packages  Also install Raspberry Pi OS packages:"
+      echo "                             python3, python3-venv, python3-picamera2, python3-opencv"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg"
+      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages]"
+      exit 1
+      ;;
+  esac
+done
+
 echo "Setting up Homebase Camera in: $SCRIPT_DIR"
 
 mkdir -p data data/snapshots config
+
+if [[ "$INSTALL_SYSTEM_PACKAGES" == "1" ]]; then
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "apt-get was not found. --install-system-packages is intended for Raspberry Pi OS/Debian."
+    exit 1
+  fi
+  APT_PREFIX=()
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    APT_PREFIX=(sudo)
+  fi
+  echo "Installing Raspberry Pi OS system packages for camera support..."
+  "${APT_PREFIX[@]}" apt-get update
+  "${APT_PREFIX[@]}" apt-get install -y python3 python3-venv python3-picamera2 python3-opencv
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 was not found. Install it first: sudo apt install python3 python3-venv"

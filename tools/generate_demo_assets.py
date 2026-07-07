@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 
@@ -63,29 +65,81 @@ TIMELINE = [
 ]
 
 
+@dataclass(frozen=True)
+class GenerationSummary:
+    generated: tuple[Path, ...]
+    skipped: tuple[Path, ...]
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate Homebase Camera PC demo assets.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing demo seats, timeline, and frame assets.",
+    )
+    args = parser.parse_args()
+    summary = generate_demo_assets(ROOT, force=args.force)
     demo_dir = ROOT / "demo"
+    print(
+        f"Demo assets ready under {demo_dir} "
+        f"({len(summary.generated)} generated, {len(summary.skipped)} existing skipped)."
+    )
+    if summary.skipped and not args.force:
+        print("Existing demo assets were preserved. Use --force to reset them.")
+    return 0
+
+
+def generate_demo_assets(root: Path = ROOT, *, force: bool = False) -> GenerationSummary:
+    demo_dir = Path(root) / "demo"
     frames_dir = demo_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[Path] = []
+    skipped: list[Path] = []
 
     for step in TIMELINE:
+        target = frames_dir / step["frame"]
+        if target.exists() and not force:
+            skipped.append(target)
+            continue
         image = _base_scene(step["label"])
         draw = ImageDraw.Draw(image)
         for zone in ZONES:
             state = int(step["states"][zone["seat_id"]])
             _draw_zone_state(draw, zone, state)
-        image.save(frames_dir / step["frame"], quality=92)
+        image.save(target, quality=92)
+        generated.append(target)
 
-    (demo_dir / "demo_seats.json").write_text(
+    _write_text_asset(
+        demo_dir / "demo_seats.json",
         json.dumps({"zones": ZONES}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+        force=force,
+        generated=generated,
+        skipped=skipped,
     )
-    (demo_dir / "demo_timeline.json").write_text(
+    _write_text_asset(
+        demo_dir / "demo_timeline.json",
         json.dumps({"steps": [_timeline_step(step) for step in TIMELINE]}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+        force=force,
+        generated=generated,
+        skipped=skipped,
     )
-    print(f"Generated demo assets under {demo_dir}")
-    return 0
+    return GenerationSummary(generated=tuple(generated), skipped=tuple(skipped))
+
+
+def _write_text_asset(
+    path: Path,
+    content: str,
+    *,
+    force: bool,
+    generated: list[Path],
+    skipped: list[Path],
+) -> None:
+    if path.exists() and not force:
+        skipped.append(path)
+        return
+    path.write_text(content, encoding="utf-8", newline="\n")
+    generated.append(path)
 
 
 def _base_scene(label: str) -> Image.Image:

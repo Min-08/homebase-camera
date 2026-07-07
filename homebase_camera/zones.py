@@ -55,10 +55,15 @@ def load_zones(
     source = requested
     if not requested.exists():
         source = fallback
-        warnings.append("config/seats.json was not found; using config/seats.example.json.")
+        warnings.append(f"{_display_path(requested, root)} was not found; using {_display_path(fallback, root)}.")
 
     if not source.exists():
-        raise ZoneConfigError("No seats.json or seats.example.json file was found.")
+        if requested == fallback:
+            raise ZoneConfigError(f"Zone file was not found: {_display_path(requested, root)}.")
+        raise ZoneConfigError(
+            "No usable zone file was found. Checked "
+            f"{_display_path(requested, root)} and {_display_path(fallback, root)}."
+        )
 
     try:
         raw = json.loads(source.read_text(encoding="utf-8"))
@@ -186,6 +191,13 @@ def _parse_zones(raw: dict, *, include_disabled: bool) -> list[Zone]:
 
 def _is_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _display_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
 
 
 def _point_on_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> bool:
