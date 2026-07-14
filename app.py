@@ -24,6 +24,7 @@ from homebase_camera.diff_detector import DiffDetector
 from homebase_camera.scheduler import IntervalGate, RuntimeSnapshot
 from homebase_camera.state_engine import SeatDecision, SeatStateEngine, ZoneEvidence
 from homebase_camera.storage import StatusStore
+from homebase_camera.streaming import StreamServerInfo, ensure_streaming_server
 from homebase_camera.validation import polygon_area, validate_zones
 from homebase_camera.visualization import STATUS_COLORS, STATUS_SHORT_LABELS, draw_zones
 from homebase_camera.yolo_detector import YoloDetector
@@ -52,6 +53,7 @@ def main() -> None:
         st.info(warning)
 
     runtime_detection, ui_state = _sidebar_controls(config, demo_mode)
+    stream_info = _start_live_stream(config, demo_mode)
     refresh_count = _auto_refresh(ui_state)
     demo_step = _demo_controls(config, demo_mode, refresh_count, ui_state)
 
@@ -71,10 +73,10 @@ def main() -> None:
     tab_monitor, tab_editor, tab_logs, tab_settings = st.tabs(["Monitor", "Zone Editor", "Logs", "Settings"])
 
     with tab_monitor:
-        _monitor_tab(config, runtime_detection, frame, frame_result.message, zones, demo_step)
+        _monitor_tab(config, runtime_detection, frame, frame_result.message, zones, demo_step, stream_info)
 
     with tab_editor:
-        _zone_editor_tab(config, frame, editor_zones, demo_mode)
+        _zone_editor_tab(config, frame, editor_zones, demo_mode, stream_info)
 
     with tab_logs:
         _logs_tab(config)
@@ -155,6 +157,16 @@ def _auto_refresh(ui_state: dict[str, Any]) -> int:
     return count
 
 
+def _start_live_stream(config: AppConfig, demo_mode: bool) -> StreamServerInfo | None:
+    if demo_mode or not config.streaming.enabled:
+        return None
+    try:
+        return ensure_streaming_server(config, _capture_manager(config))
+    except Exception as exc:
+        st.warning(f"Live stream server is unavailable: {exc}")
+        return None
+
+
 def _demo_controls(config: AppConfig, demo_mode: bool, refresh_count: int, ui_state: dict[str, Any]) -> DemoStep | None:
     if not demo_mode:
         return None
@@ -231,7 +243,11 @@ def _monitor_tab(
     frame_message: str,
     zones: list[Zone],
     demo_step: DemoStep | None,
+    stream_info: StreamServerInfo | None,
 ) -> None:
+    if stream_info is not None:
+        _live_stream_panel(stream_info)
+
     if not zones:
         st.info("No enabled zones are configured yet. Open Zone Editor or run tools/zone_editor_cv.py.")
         st.image(Image.fromarray(frame), caption=frame_message, width="stretch")
@@ -271,6 +287,21 @@ def _monitor_tab(
         st.subheader("Seat Status")
         for decision in decisions.values():
             _status_card(decision)
+
+
+def _live_stream_panel(stream_info: StreamServerInfo) -> None:
+    st.subheader("Live Camera Stream")
+    st.markdown(
+        f"""
+        <img
+          src="{stream_info.stream_url}"
+          style="width:100%;max-height:72vh;object-fit:contain;background:#111827;border:1px solid #cbd5e1"
+          alt="Live camera stream">
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Live stream: {stream_info.stream_url}")
+    st.link_button("Open live zone editor", stream_info.zone_editor_url)
 
 
 def _run_analysis(
@@ -382,8 +413,28 @@ def _status_card(decision: SeatDecision) -> None:
     )
 
 
-def _zone_editor_tab(config: AppConfig, frame: np.ndarray, zones: list[Zone], demo_mode: bool) -> None:
+def _zone_editor_tab(
+    config: AppConfig,
+    frame: np.ndarray,
+    zones: list[Zone],
+    demo_mode: bool,
+    stream_info: StreamServerInfo | None,
+) -> None:
     st.subheader("Zone Editor")
+    if stream_info is not None:
+        st.info("Use the live editor below to draw zones directly on the camera stream.")
+        st.link_button("Open live zone editor in a new tab", stream_info.zone_editor_url)
+        st.markdown(
+            f"""
+            <iframe
+              src="{stream_info.zone_editor_url}"
+              style="width:100%;height:760px;border:1px solid #cbd5e1;background:white"
+              title="Homebase live zone editor"></iframe>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
     if not zones:
         st.warning("No zones are configured. Draw a polygon and save the first seat zone.")
     st.write("Draw a polygon around one seat, enter a seat id/name, then save. Existing zones can be renamed, disabled, duplicated, or deleted below.")

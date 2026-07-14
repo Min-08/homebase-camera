@@ -73,6 +73,15 @@ class DemoConfig:
 
 
 @dataclass(frozen=True)
+class StreamingConfig:
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8502
+    fps: int = 10
+    jpeg_quality: int = 75
+
+
+@dataclass(frozen=True)
 class AppConfig:
     project_root: Path
     settings_path: Path
@@ -82,6 +91,7 @@ class AppConfig:
     storage: StorageConfig
     privacy: PrivacyConfig
     demo: DemoConfig
+    streaming: StreamingConfig
     mock_mode: bool = False
     warnings: tuple[str, ...] = ()
 
@@ -123,11 +133,13 @@ def load_settings(path: str | Path | None = None) -> AppConfig:
     storage = _build_dataclass(StorageConfig(), data.get("storage", {}), "storage")
     privacy = _build_dataclass(PrivacyConfig(), data.get("privacy", {}), "privacy")
     demo = _build_dataclass(DemoConfig(), data.get("demo", {}), "demo")
+    streaming = _build_dataclass(StreamingConfig(), data.get("streaming", {}), "streaming")
 
     ui = _validate_ui(ui)
     detection = _validate_detection(detection)
     storage = _validate_storage(storage)
     privacy = _validate_privacy(privacy)
+    streaming = _validate_streaming(streaming)
 
     source_override = os.getenv("HOMEBASE_CAMERA_SOURCE")
     if source_override:
@@ -151,6 +163,7 @@ def load_settings(path: str | Path | None = None) -> AppConfig:
         storage=storage,
         privacy=privacy,
         demo=demo,
+        streaming=streaming,
         mock_mode=mock_mode or camera.source == "mock",
         warnings=tuple(warnings),
     )
@@ -212,6 +225,19 @@ def _validate_privacy(config: PrivacyConfig) -> PrivacyConfig:
     if int(config.snapshot_interval_seconds) < 1:
         raise ConfigError("snapshot_interval_seconds must be at least 1.")
     return replace(config, snapshot_interval_seconds=int(config.snapshot_interval_seconds))
+
+
+def _validate_streaming(config: StreamingConfig) -> StreamingConfig:
+    port = int(config.port)
+    fps = int(config.fps)
+    jpeg_quality = int(config.jpeg_quality)
+    if not 1 <= port <= 65535:
+        raise ConfigError("streaming.port must be between 1 and 65535.")
+    if not 1 <= fps <= 30:
+        raise ConfigError("streaming.fps must be between 1 and 30.")
+    if not 40 <= jpeg_quality <= 95:
+        raise ConfigError("streaming.jpeg_quality must be between 40 and 95.")
+    return replace(config, port=port, fps=fps, jpeg_quality=jpeg_quality)
 
 
 def _display_path(path: Path, root: Path) -> str:

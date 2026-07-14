@@ -42,3 +42,10 @@ assets_dir = "demo/frames"
 autoplay = true
 show_ground_truth = true
 show_detector_evidence = true
+
+[streaming]
+enabled = true
+host = "0.0.0.0"
+port = 8502
+fps = 10
+jpeg_quality = 75

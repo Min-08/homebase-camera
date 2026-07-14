@@ -27,27 +27,67 @@ class CaptureManager:
         self._picamera: Any | None = None
         self._cv_capture: Any | None = None
         self._lock = threading.Lock()
+        self._background_stop = threading.Event()
+        self._background_thread: threading.Thread | None = None
+        self._latest_result: FrameResult | None = None
+        self._latest_monotonic = 0.0
         self._last_snapshot_save_monotonic = 0.0
         self.last_message = ""
 
     def read_frame(self) -> FrameResult:
         with self._lock:
-            source = self.camera_config.source.lower()
-            if self.app_config.mock_mode or source == "mock":
-                return self._read_mock_frame()
-            if source == "picamera2":
-                result = self._read_picamera2()
-                if result.ok:
-                    return result
-                return self._placeholder(result.message)
-            if source in {"opencv", "usb", "video"}:
-                result = self._read_opencv()
-                if result.ok:
-                    return result
-                return self._placeholder(result.message)
-            if source == "demo":
-                return self._read_mock_frame()
-            return self._placeholder(f"Unknown camera source '{self.camera_config.source}'. Use picamera2, opencv, video, demo, or mock.")
+            if self._latest_result is not None and self._background_thread is not None and self._background_thread.is_alive():
+                return self._latest_result
+            return self._read_frame_locked()
+
+    def latest_frame(self) -> FrameResult:
+        with self._lock:
+            if self._latest_result is not None:
+                return self._latest_result
+            return self._read_frame_locked()
+
+    def start_background(self, fps: int = 10) -> None:
+        if self._background_thread is not None and self._background_thread.is_alive():
+            return
+        self._background_stop.clear()
+        interval = 1.0 / max(1, int(fps))
+        self._background_thread = threading.Thread(
+            target=self._background_loop,
+            args=(interval,),
+            name="homebase-camera-capture",
+            daemon=True,
+        )
+        self._background_thread.start()
+
+    def background_running(self) -> bool:
+        return self._background_thread is not None and self._background_thread.is_alive()
+
+    def _background_loop(self, interval: float) -> None:
+        while not self._background_stop.is_set():
+            started = time.monotonic()
+            with self._lock:
+                self._latest_result = self._read_frame_locked()
+                self._latest_monotonic = started
+            elapsed = time.monotonic() - started
+            self._background_stop.wait(max(0.01, interval - elapsed))
+
+    def _read_frame_locked(self) -> FrameResult:
+        source = self.camera_config.source.lower()
+        if self.app_config.mock_mode or source == "mock":
+            return self._read_mock_frame()
+        if source == "picamera2":
+            result = self._read_picamera2()
+            if result.ok:
+                return result
+            return self._placeholder(result.message)
+        if source in {"opencv", "usb", "video"}:
+            result = self._read_opencv()
+            if result.ok:
+                return result
+            return self._placeholder(result.message)
+        if source == "demo":
+            return self._read_mock_frame()
+        return self._placeholder(f"Unknown camera source '{self.camera_config.source}'. Use picamera2, opencv, video, demo, or mock.")
 
     def save_latest_snapshot(self, frame: np.ndarray) -> Path | None:
         if not self.app_config.privacy.save_snapshots:
@@ -64,6 +104,9 @@ class CaptureManager:
             return path
 
     def close(self) -> None:
+        self._background_stop.set()
+        if self._background_thread is not None and self._background_thread.is_alive():
+            self._background_thread.join(timeout=2)
         with self._lock:
             if self._picamera is not None:
                 try:
