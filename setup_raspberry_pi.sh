@@ -125,7 +125,7 @@ fi
 
 chmod +x setup_raspberry_pi.sh run_app.sh run_mock.sh homebase
 if [[ -f "scripts/install_desktop_launcher.sh" ]]; then
-  chmod +x scripts/install_desktop_launcher.sh scripts/pi_control.sh
+  chmod +x scripts/install_desktop_launcher.sh scripts/pi_control.sh scripts/configure_direct_ethernet.sh
 fi
 
 if [[ "$INSTALL_LAUNCHERS" == "1" ]]; then

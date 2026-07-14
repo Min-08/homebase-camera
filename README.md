@@ -75,6 +75,34 @@ MJPEG 스트림:   http://<라즈베리파이-IP>:8502/stream.mjpg
 
 프레임이 멈추거나 업데이트가 느리면 먼저 `./homebase health`를 실행합니다. 카메라 상태가 응답하지 않으면 `./homebase restart`로 재시작하고, 계속 실패하면 `./homebase logs`에서 오류를 확인합니다.
 
+### PC와 랜선 직접 연결
+
+공유기 없이 Raspberry Pi와 Windows PC를 랜선 하나로 직접 연결할 수도 있습니다. 기술적으로는 직렬 연결이 아니라 Ethernet 직결입니다. Pi에서 다음 설정을 한 번 실행합니다.
+
+```bash
+cd ~/homebase-camera
+sudo ./scripts/configure_direct_ethernet.sh
+```
+
+Windows PC의 **네트워크 연결 > Ethernet > 인터넷 프로토콜 버전 4(TCP/IPv4)**에서 다음 값을 지정합니다.
+
+```text
+IP 주소:       192.168.250.1
+서브넷 마스크: 255.255.255.0
+기본 게이트웨이: 비워 둠
+DNS 서버:       비워 둠
+```
+
+그다음 Pi와 PC를 랜선으로 직접 연결하고 다음 주소를 사용합니다. 일반 랜선을 사용하면 되며 크로스 케이블은 필요하지 않습니다.
+
+```text
+RealVNC Viewer: 192.168.250.2
+대시보드:       http://192.168.250.2:8501/
+라이브 조닝:    http://192.168.250.2:8502/zone-editor
+```
+
+이 보조 주소는 기존 공유기 DHCP 주소와 함께 사용할 수 있습니다. 직결 설정을 제거하려면 `sudo ./scripts/configure_direct_ethernet.sh --remove`를 실행합니다.
+
 ## Raspberry Pi Real Camera Quick Start
 
 ```bash
@@ -390,7 +418,7 @@ Run tests without Raspberry Pi hardware or YOLO:
 ```bash
 python -m pytest
 python -m compileall app.py homebase_camera tools tests
-bash -n homebase setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh scripts/pi_control.sh scripts/install_desktop_launcher.sh
+bash -n homebase setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh scripts/pi_control.sh scripts/install_desktop_launcher.sh scripts/configure_direct_ethernet.sh
 python tools/generate_demo_assets.py
 python tools/generate_demo_assets.py --force
 ```
