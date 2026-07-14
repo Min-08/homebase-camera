@@ -120,7 +120,7 @@ Additional Python probes measured snapshot latency, MJPEG frame timing, four con
 | Check | Result |
 |---|---|
 | Local `python -m pytest -q` | 34 passed |
-| Pi `python -m pytest -q` before final documentation/config hardening | 29 passed |
+| Pi `python -m pytest -q` | 34 passed |
 | Python compileall | Passed |
 | Shell syntax | Passed |
 | Zone editor/status page JavaScript syntax | Passed |
