@@ -327,7 +327,7 @@ def _guess_lan_ip() -> str:
 
 
 def _jpeg_bytes(frame: Any, *, quality: int) -> bytes:
-    image = Image.fromarray(frame).convert("RGB")
+    image = frame.convert("RGB") if isinstance(frame, Image.Image) else Image.fromarray(frame).convert("RGB")
     output = BytesIO()
     image.save(output, format="JPEG", quality=int(quality), optimize=False)
     return output.getvalue()
