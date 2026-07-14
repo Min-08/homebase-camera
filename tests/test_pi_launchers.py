@@ -56,6 +56,7 @@ def test_desktop_launcher_installer_creates_all_module_shortcuts(tmp_path: Path)
         assert f'Exec=/bin/bash "{ROOT.as_posix()}/scripts/pi_control.sh" {action}' in contents
         assert f"Path={ROOT.as_posix()}" in contents
         assert "Terminal=true" in contents
+        assert "Categories=Utility;" in contents
         assert (applications_dir / file_name).read_text(encoding="utf-8") == contents
 
 

@@ -50,7 +50,7 @@ Path=$PROJECT_DIR
 Icon=$icon
 Terminal=true
 StartupNotify=true
-Categories=Utility;AudioVideo;
+Categories=Utility;
 EOF
 
   chmod +x "$desktop_file"
