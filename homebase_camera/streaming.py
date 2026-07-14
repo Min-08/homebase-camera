@@ -15,6 +15,10 @@ from PIL import Image
 
 from .capture import CaptureManager
 from .config import AppConfig, resolve_path
+from .diff_detector import DiffDetector
+from .state_engine import SeatStateEngine
+from .storage import StatusStore
+from .visualization import draw_zones
 from .zones import Zone, ZoneConfigError, load_zones, save_zones
 
 
@@ -39,6 +43,7 @@ class LiveStreamServer:
             config,
             capture,
         )
+        self.httpd.analyzer = LiveAnalysisWorker(config, capture)
         self.thread = threading.Thread(
             target=self.httpd.serve_forever,
             name="homebase-camera-stream-server",
@@ -46,6 +51,7 @@ class LiveStreamServer:
         )
 
     def start(self) -> None:
+        self.httpd.analyzer.start()
         if not self.thread.is_alive():
             self.thread.start()
 
@@ -73,6 +79,7 @@ class _HomebaseHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.config = config
         self.capture = capture
+        self.analyzer: LiveAnalysisWorker
 
 
 class _StreamHandler(BaseHTTPRequestHandler):
@@ -87,7 +94,16 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self._send_html(_zone_editor_html())
             return
         if parsed.path == "/health":
-            self._send_json({"ok": True, "fps": self.server.config.streaming.fps})
+            self._send_json(
+                {
+                    "ok": True,
+                    "fps": self.server.config.streaming.fps,
+                    "frame_age_seconds": self.server.capture.frame_age_seconds(),
+                    "frame_ok": self.server.capture.latest_ok(),
+                    "frame_message": self.server.capture.latest_message(),
+                    "analysis": self.server.analyzer.status(),
+                }
+            )
             return
         if parsed.path == "/snapshot.jpg":
             self._send_snapshot()
@@ -98,6 +114,15 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/zones":
             target = parse_qs(parsed.query).get("target", ["config"])[0]
             self._send_json(_load_zone_payload(self.server.config, target))
+            return
+        if parsed.path == "/api/status":
+            self._send_json(
+                {
+                    "ok": True,
+                    "analysis": self.server.analyzer.status(),
+                    "current": self.server.analyzer.current_rows(),
+                }
+            )
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -133,7 +158,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         while True:
             try:
                 jpeg = _jpeg_bytes(
-                    self.server.capture.latest_frame().frame,
+                    _frame_with_overlay(self.server.config, self.server.capture, self.server.analyzer),
                     quality=self.server.config.streaming.jpeg_quality,
                 )
                 self.wfile.write(b"--frame\r\n")
@@ -150,7 +175,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def _send_snapshot(self) -> None:
         jpeg = _jpeg_bytes(
-            self.server.capture.latest_frame().frame,
+            _frame_with_overlay(self.server.config, self.server.capture, self.server.analyzer),
             quality=self.server.config.streaming.jpeg_quality,
         )
         self.send_response(HTTPStatus.OK)
@@ -202,6 +227,85 @@ def ensure_streaming_server(config: AppConfig, capture: CaptureManager) -> Strea
         return _SERVER.info
 
 
+class LiveAnalysisWorker:
+    def __init__(self, config: AppConfig, capture: CaptureManager) -> None:
+        self.config = config
+        self.capture = capture
+        self.store = StatusStore(
+            config.storage.db_path,
+            timeout_seconds=config.storage.timeout_seconds,
+            busy_timeout_ms=config.storage.busy_timeout_ms,
+            wal_enabled=config.storage.wal_enabled,
+        )
+        self.detector = DiffDetector.from_config(config.detection)
+        self.engine = SeatStateEngine.from_config(config.detection)
+        self.engine.restore_statuses(self.store.get_current())
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._last_run = "never"
+        self._last_error = ""
+        self._last_warning = ""
+        self._last_zone_count = 0
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="homebase-camera-analysis", daemon=True)
+        self._thread.start()
+
+    def status(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "running": self._thread is not None and self._thread.is_alive(),
+                "last_run": self._last_run,
+                "last_error": self._last_error,
+                "last_warning": self._last_warning,
+                "zone_count": self._last_zone_count,
+            }
+
+    def current_rows(self) -> list[dict]:
+        return self.store.get_current()
+
+    def current_status_map(self) -> dict[str, int]:
+        return {str(row["seat_id"]): int(row["status"]) for row in self.store.get_current()}
+
+    def _loop(self) -> None:
+        interval = max(0.5, float(self.config.detection.diff_interval_seconds))
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                self._run_once()
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(0.1, interval - elapsed))
+
+    def _run_once(self) -> None:
+        zones = _load_enabled_zones(self.config)
+        frame_result = self.capture.latest_frame()
+        if not zones or not frame_result.ok:
+            with self._lock:
+                self._last_zone_count = len(zones)
+                self._last_error = "" if frame_result.ok else frame_result.message
+                self._last_run = _now_label()
+            return
+        evidence = self.detector.analyze(frame_result.frame, zones)
+        decisions = self.engine.update_all(zones, evidence)
+        self.store.upsert_many(decisions.values())
+        with self._lock:
+            self._last_zone_count = len(zones)
+            self._last_error = ""
+            self._last_warning = self.detector.warning or ""
+            self._last_run = _now_label()
+
+
+def _now_label() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
 def public_base_url(config: AppConfig) -> str:
     configured = socket.getfqdn()
     if configured in {"localhost", "localhost.localdomain"}:
@@ -227,6 +331,21 @@ def _jpeg_bytes(frame: Any, *, quality: int) -> bytes:
     output = BytesIO()
     image.save(output, format="JPEG", quality=int(quality), optimize=False)
     return output.getvalue()
+
+
+def _frame_with_overlay(config: AppConfig, capture: CaptureManager, analyzer: LiveAnalysisWorker) -> Any:
+    frame = capture.latest_frame().frame
+    zones = _load_enabled_zones(config)
+    if not zones:
+        return frame
+    return draw_zones(frame, zones, analyzer.current_status_map())
+
+
+def _load_enabled_zones(config: AppConfig) -> list[Zone]:
+    try:
+        return list(load_zones("config/seats.json", fallback_path="config/seats.example.json").zones)
+    except ZoneConfigError:
+        return []
 
 
 def _target_path(config: AppConfig, target: str) -> str:
@@ -326,6 +445,8 @@ button.danger { background: #991b1b; border-color: #991b1b; }
 #status { min-height: 20px; margin-top: 10px; font-size: 13px; color: #334155; }
 #zones { font-size: 13px; max-height: 240px; overflow: auto; border-top: 1px solid #e2e8f0; margin-top: 12px; padding-top: 8px; }
 .zone { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid #f1f5f9; }
+.statuses { font-size: 13px; max-height: 180px; overflow: auto; border-top: 1px solid #e2e8f0; margin-top: 12px; padding-top: 8px; }
+.status-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #f8fafc; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -353,6 +474,7 @@ button.danger { background: #991b1b; border-color: #991b1b; }
       <button class="secondary" id="clear">Clear</button>
     </div>
     <div id="status"></div>
+    <div id="currentStatus" class="statuses"></div>
     <div id="zones"></div>
   </aside>
 </main>
@@ -432,6 +554,34 @@ async function loadZones() {
   draw();
 }
 
+async function loadStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    const el = document.getElementById('currentStatus');
+    const rows = data.current || [];
+    const analysis = data.analysis || {};
+    el.innerHTML = '<strong>Current status</strong>';
+    const meta = document.createElement('div');
+    meta.style.color = '#64748b';
+    meta.style.margin = '4px 0 8px';
+    meta.textContent = `analysis: ${analysis.last_run || 'never'} ${analysis.last_error ? '(' + analysis.last_error + ')' : ''}`;
+    el.appendChild(meta);
+    rows.forEach(row => {
+      const div = document.createElement('div');
+      div.className = 'status-row';
+      const left = document.createElement('span');
+      left.textContent = row.seat_id;
+      const right = document.createElement('span');
+      right.textContent = `${row.status} / ${Number(row.confidence || 0).toFixed(2)}`;
+      div.append(left, right);
+      el.appendChild(div);
+    });
+  } catch (err) {
+    document.getElementById('currentStatus').textContent = `status unavailable: ${err}`;
+  }
+}
+
 function renderZones() {
   const el = document.getElementById('zones');
   el.innerHTML = '<strong>Existing zones</strong>';
@@ -500,7 +650,9 @@ document.getElementById('save').onclick = async () => {
 img.onload = resizeCanvas;
 window.addEventListener('resize', resizeCanvas);
 setInterval(resizeCanvas, 1000);
+setInterval(loadStatus, 1000);
 loadZones();
+loadStatus();
 </script>
 </body>
 </html>

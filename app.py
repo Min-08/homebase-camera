@@ -262,8 +262,10 @@ def _monitor_tab(
 
     left, right = st.columns([1.7, 1], gap="large")
     with left:
-        st.subheader("Camera Frame")
+        st.subheader("Analysis Snapshot")
         st.image(overlay, caption=frame_message, width="stretch")
+        if stream_info is not None:
+            st.caption("This snapshot updates with dashboard refreshes. Use the live stream above for real-time video.")
         _runtime_metrics(runtime, runtime_detection, demo_step is not None)
         if st.session_state.get("last_diff_warning"):
             st.warning(st.session_state.last_diff_warning)

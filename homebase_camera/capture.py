@@ -26,7 +26,8 @@ class CaptureManager:
         self.camera_config = config.camera
         self._picamera: Any | None = None
         self._cv_capture: Any | None = None
-        self._lock = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._latest_lock = threading.Lock()
         self._background_stop = threading.Event()
         self._background_thread: threading.Thread | None = None
         self._latest_result: FrameResult | None = None
@@ -35,16 +36,48 @@ class CaptureManager:
         self.last_message = ""
 
     def read_frame(self) -> FrameResult:
-        with self._lock:
-            if self._latest_result is not None and self._background_thread is not None and self._background_thread.is_alive():
-                return self._latest_result
+        if self.background_running():
+            with self._latest_lock:
+                if self._latest_result is not None:
+                    return self._latest_result
+        with self._capture_lock:
             return self._read_frame_locked()
 
-    def latest_frame(self) -> FrameResult:
-        with self._lock:
-            if self._latest_result is not None:
-                return self._latest_result
-            return self._read_frame_locked()
+    def latest_frame(self, *, allow_stale: bool = True) -> FrameResult:
+        if allow_stale:
+            with self._latest_lock:
+                if self._latest_result is not None:
+                    return self._latest_result
+        with self._capture_lock:
+            result = self._read_frame_locked()
+        with self._latest_lock:
+            self._latest_result = result
+            self._latest_monotonic = time.monotonic()
+        return result
+
+    def frame_age_seconds(self) -> float | None:
+        with self._latest_lock:
+            if self._latest_result is None or self._latest_monotonic <= 0:
+                return None
+            return max(0.0, time.monotonic() - self._latest_monotonic)
+
+    def latest_ok(self) -> bool:
+        with self._latest_lock:
+            return bool(self._latest_result and self._latest_result.ok)
+
+    def latest_message(self) -> str:
+        with self._latest_lock:
+            if self._latest_result is None:
+                return "No frame captured yet."
+            return self._latest_result.message
+
+    def refresh_latest_once(self) -> FrameResult:
+        with self._capture_lock:
+            result = self._read_frame_locked()
+        with self._latest_lock:
+            self._latest_result = result
+            self._latest_monotonic = time.monotonic()
+        return result
 
     def start_background(self, fps: int = 10) -> None:
         if self._background_thread is not None and self._background_thread.is_alive():
@@ -65,9 +98,8 @@ class CaptureManager:
     def _background_loop(self, interval: float) -> None:
         while not self._background_stop.is_set():
             started = time.monotonic()
-            with self._lock:
-                self._latest_result = self._read_frame_locked()
-                self._latest_monotonic = started
+            result = self.refresh_latest_once()
+            self.last_message = result.message
             elapsed = time.monotonic() - started
             self._background_stop.wait(max(0.01, interval - elapsed))
 
@@ -94,7 +126,7 @@ class CaptureManager:
             return None
         now = time.monotonic()
         interval = max(1, int(self.app_config.privacy.snapshot_interval_seconds))
-        with self._lock:
+        with self._latest_lock:
             if self._last_snapshot_save_monotonic and now - self._last_snapshot_save_monotonic < interval:
                 return None
             path = resolve_path("data/snapshots/latest.jpg", self.app_config.project_root)
@@ -107,7 +139,7 @@ class CaptureManager:
         self._background_stop.set()
         if self._background_thread is not None and self._background_thread.is_alive():
             self._background_thread.join(timeout=2)
-        with self._lock:
+        with self._capture_lock:
             if self._picamera is not None:
                 try:
                     self._picamera.stop()
