@@ -86,6 +86,7 @@ class CaptureManager:
         with self._latest_lock:
             self._latest_result = result
             self._latest_monotonic = time.monotonic()
+            self._latest_sequence += 1
         return result
 
     def start_background(self, fps: int = 10) -> None:

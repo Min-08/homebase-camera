@@ -37,4 +37,5 @@ def test_background_capture_recovers_after_unexpected_exception(monkeypatch):
     assert status["running"] is True
     assert status["failure_count"] >= 1
     assert status["frame_count"] >= 1
+    assert status["latest_sequence"] >= status["frame_count"]
     assert manager.latest_ok() is True
