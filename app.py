@@ -433,7 +433,7 @@ def _zone_editor_tab(
             """,
             unsafe_allow_html=True,
         )
-        st.divider()
+        return
 
     if not zones:
         st.warning("No zones are configured. Draw a polygon and save the first seat zone.")
