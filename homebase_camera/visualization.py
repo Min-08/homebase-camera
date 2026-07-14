@@ -27,9 +27,8 @@ def draw_zones(
     zones: list[Zone] | tuple[Zone, ...],
     statuses: Mapping[str, int] | None = None,
 ) -> Image.Image:
-    image = Image.fromarray(_ensure_rgb(frame)).convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    image = Image.fromarray(_ensure_rgb(frame)).convert("RGB")
+    draw = ImageDraw.Draw(image, "RGBA")
     statuses = statuses or {}
 
     for zone in zones:
@@ -49,7 +48,7 @@ def draw_zones(
             draw.rectangle((box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2), fill=(15, 23, 42, 190))
             draw.text((label_x, max(0, label_y - 22)), label, fill=(255, 255, 255, 255))
 
-    return Image.alpha_composite(image, overlay).convert("RGB")
+    return image
 
 
 def _ensure_rgb(frame: np.ndarray) -> np.ndarray:
