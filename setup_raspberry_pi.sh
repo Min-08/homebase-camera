@@ -10,21 +10,26 @@ if [[ ! -f "app.py" || ! -f "requirements.txt" ]]; then
 fi
 
 INSTALL_SYSTEM_PACKAGES=0
+INSTALL_LAUNCHERS=0
 for arg in "$@"; do
   case "$arg" in
     --install-system-packages)
       INSTALL_SYSTEM_PACKAGES=1
       ;;
+    --install-launchers)
+      INSTALL_LAUNCHERS=1
+      ;;
     -h|--help)
-      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages]"
+      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages] [--install-launchers]"
       echo ""
       echo "  --install-system-packages  Also install Raspberry Pi OS packages:"
-      echo "                             python3, python3-venv, python3-picamera2, python3-opencv"
+      echo "                             python3, python3-venv, python3-picamera2, python3-opencv, curl"
+      echo "  --install-launchers        Install one-click desktop and application-menu launchers"
       exit 0
       ;;
     *)
       echo "Unknown option: $arg"
-      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages]"
+      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages] [--install-launchers]"
       exit 1
       ;;
   esac
@@ -45,7 +50,7 @@ if [[ "$INSTALL_SYSTEM_PACKAGES" == "1" ]]; then
   fi
   echo "Installing Raspberry Pi OS system packages for camera support..."
   "${APT_PREFIX[@]}" apt-get update
-  "${APT_PREFIX[@]}" apt-get install -y python3 python3-venv python3-picamera2 python3-opencv
+  "${APT_PREFIX[@]}" apt-get install -y python3 python3-venv python3-picamera2 python3-opencv curl
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -118,15 +123,22 @@ else
   echo "Keeping existing config/seats.json."
 fi
 
-chmod +x setup_raspberry_pi.sh run_app.sh run_mock.sh
+chmod +x setup_raspberry_pi.sh run_app.sh run_mock.sh homebase
 if [[ -f "scripts/install_desktop_launcher.sh" ]]; then
-  chmod +x scripts/install_desktop_launcher.sh
+  chmod +x scripts/install_desktop_launcher.sh scripts/pi_control.sh
+fi
+
+if [[ "$INSTALL_LAUNCHERS" == "1" ]]; then
+  ./scripts/install_desktop_launcher.sh
 fi
 
 echo ""
 echo "Setup complete."
 echo "Next command:"
-echo "  ./run_app.sh"
+echo "  ./homebase"
+echo ""
+echo "Install Raspberry Pi desktop launchers:"
+echo "  ./scripts/install_desktop_launcher.sh"
 echo ""
 echo "No Raspberry Pi camera available? Use:"
 echo "  ./run_mock.sh"

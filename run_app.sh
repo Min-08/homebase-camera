@@ -28,4 +28,4 @@ echo "Starting Homebase Camera dashboard..."
 echo "Open this on the Raspberry Pi: http://localhost:8501"
 echo "From another device on the same network, open: http://<raspberry-pi-ip>:8501"
 
-printf '\n' | python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --browser.gatherUsageStats false
+exec python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --browser.gatherUsageStats false
