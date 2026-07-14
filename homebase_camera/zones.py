@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -81,7 +83,25 @@ def save_zones(zones: Sequence[Zone], path: str | Path | None = None) -> Path:
     target = resolve_path(path or "config/seats.json")
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"zones": [zone.to_json() for zone in zones]}
-    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, target)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
     return target
 
 

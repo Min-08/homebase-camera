@@ -23,6 +23,7 @@ class DiffDetector:
         self.diff_threshold = int(diff_threshold)
         self.change_ratio_threshold = float(change_ratio_threshold)
         self._baseline: np.ndarray | None = None
+        self._temporary_baseline = False
         self.warning: str | None = None
 
     @classmethod
@@ -37,6 +38,7 @@ class DiffDetector:
         baseline = self._get_baseline(frame)
         if baseline is None:
             self._baseline = frame.copy()
+            self._temporary_baseline = True
             baseline_problem = self.warning
             fallback_warning = (
                 "No baseline image found. The current frame is being used as a temporary baseline. "
@@ -59,6 +61,13 @@ class DiffDetector:
                 f"Baseline resolution {baseline.shape[1]}x{baseline.shape[0]} does not match "
                 f"current frame {frame.shape[1]}x{frame.shape[0]}; resizing baseline for this analysis. "
                 "Capture a new baseline after changing camera resolution or source."
+            )
+            if self._temporary_baseline:
+                self.warning += " The detector is still using a temporary in-memory baseline."
+        elif self._temporary_baseline:
+            self.warning = (
+                "No saved baseline image is available; the detector is using a temporary in-memory baseline. "
+                "Capture an empty baseline from the live zone editor for stable detection after restart."
             )
         else:
             self.warning = None
@@ -86,6 +95,7 @@ class DiffDetector:
 
     def set_baseline(self, frame: np.ndarray, *, save: bool = True) -> Path | None:
         self._baseline = frame.copy()
+        self._temporary_baseline = False
         self.warning = None
         if not save:
             return None
@@ -100,6 +110,7 @@ class DiffDetector:
             return None
         try:
             self._baseline = np.asarray(Image.open(self.baseline_path).convert("RGB"))
+            self._temporary_baseline = False
         except OSError as exc:
             self.warning = f"Could not read baseline image: {exc}"
             return None

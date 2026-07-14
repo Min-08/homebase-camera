@@ -37,3 +37,19 @@ def test_baseline_resolution_mismatch_warns_and_continues(tmp_path):
     assert "seat_001" in evidence
     assert detector.warning is not None
     assert "Baseline resolution 10x10 does not match current frame 20x20" in detector.warning
+
+
+def test_temporary_baseline_warning_remains_until_saved_baseline_is_set(tmp_path):
+    detector = DiffDetector(baseline_path=tmp_path / "missing.jpg")
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+
+    detector.analyze(frame, [ZONE])
+    detector.analyze(frame, [ZONE])
+
+    assert detector.warning is not None
+    assert "temporary in-memory baseline" in detector.warning
+
+    detector.set_baseline(frame, save=True)
+    detector.analyze(frame, [ZONE])
+
+    assert detector.warning is None

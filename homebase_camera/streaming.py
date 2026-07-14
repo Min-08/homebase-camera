@@ -16,13 +16,16 @@ from PIL import Image
 from .capture import CaptureManager
 from .config import AppConfig, resolve_path
 from .diff_detector import DiffDetector
-from .state_engine import SeatStateEngine
+from .state_engine import SeatDecision, SeatStateEngine, ZoneEvidence
 from .storage import StatusStore
+from .validation import validate_zones
 from .visualization import draw_zones
+from .yolo_detector import YoloDetector
 from .zones import Zone, ZoneConfigError, load_zones, save_zones
 
 
 _SERVER_LOCK = threading.Lock()
+_ZONE_WRITE_LOCK = threading.Lock()
 _SERVER: LiveStreamServer | None = None
 
 
@@ -31,6 +34,7 @@ class StreamServerInfo:
     base_url: str
     stream_url: str
     zone_editor_url: str
+    status_panel_url: str
 
 
 class LiveStreamServer:
@@ -44,6 +48,7 @@ class LiveStreamServer:
             capture,
         )
         self.httpd.analyzer = LiveAnalysisWorker(config, capture)
+        self.httpd.stream_frames = LiveFrameProducer(config, capture, self.httpd.analyzer)
         self.thread = threading.Thread(
             target=self.httpd.serve_forever,
             name="homebase-camera-stream-server",
@@ -52,8 +57,15 @@ class LiveStreamServer:
 
     def start(self) -> None:
         self.httpd.analyzer.start()
+        self.httpd.stream_frames.start()
         if not self.thread.is_alive():
             self.thread.start()
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd.stream_frames.stop()
+        self.httpd.analyzer.stop()
 
     @property
     def info(self) -> StreamServerInfo:
@@ -62,6 +74,7 @@ class LiveStreamServer:
             base_url=base_url,
             stream_url=f"{base_url}/stream.mjpg",
             zone_editor_url=f"{base_url}/zone-editor",
+            status_panel_url=f"{base_url}/status-panel",
         )
 
 
@@ -80,6 +93,7 @@ class _HomebaseHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.capture = capture
         self.analyzer: LiveAnalysisWorker
+        self.stream_frames: LiveFrameProducer
 
 
 class _StreamHandler(BaseHTTPRequestHandler):
@@ -93,6 +107,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/zone-editor"}:
             self._send_html(_zone_editor_html())
             return
+        if parsed.path == "/status-panel":
+            self._send_html(_status_panel_html())
+            return
         if parsed.path == "/health":
             self._send_json(
                 {
@@ -101,6 +118,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     "frame_age_seconds": self.server.capture.frame_age_seconds(),
                     "frame_ok": self.server.capture.latest_ok(),
                     "frame_message": self.server.capture.latest_message(),
+                    "capture": self.server.capture.background_status(),
+                    "stream": self.server.stream_frames.status(),
                     "analysis": self.server.analyzer.status(),
                 }
             )
@@ -128,15 +147,19 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/zones":
+        try:
             payload = self._read_json()
-            response = _save_zone_payload(self.server.config, payload)
-            self._send_json(response)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            self._send_json({"ok": False, "error": f"Invalid JSON request: {exc}"}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/zones":
+            self._send_api_result(_save_zone_payload(self.server.config, payload))
             return
         if parsed.path == "/api/delete-zone":
-            payload = self._read_json()
-            response = _delete_zone_payload(self.server.config, payload)
-            self._send_json(response)
+            self._send_api_result(_delete_zone_payload(self.server.config, payload))
+            return
+        if parsed.path == "/api/baseline":
+            self._send_api_result(self.server.analyzer.capture_baseline())
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -154,30 +177,30 @@ class _StreamHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
 
-        interval = 1.0 / max(1, int(self.server.config.streaming.fps))
+        last_sequence = -1
         while True:
             try:
-                jpeg = _jpeg_bytes(
-                    _frame_with_overlay(self.server.config, self.server.capture, self.server.analyzer),
-                    quality=self.server.config.streaming.jpeg_quality,
-                )
+                packet = self.server.stream_frames.wait_for_frame(last_sequence, timeout=5.0)
+                if packet is None:
+                    continue
+                last_sequence, jpeg = packet
                 self.wfile.write(b"--frame\r\n")
                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
                 self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
                 self.wfile.write(jpeg)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
-                time.sleep(interval)
             except (BrokenPipeError, ConnectionResetError):
                 return
-            except Exception:
-                time.sleep(interval)
+            except OSError:
+                return
 
     def _send_snapshot(self) -> None:
-        jpeg = _jpeg_bytes(
-            _frame_with_overlay(self.server.config, self.server.capture, self.server.analyzer),
-            quality=self.server.config.streaming.jpeg_quality,
-        )
+        packet = self.server.stream_frames.wait_for_frame(-1, timeout=5.0)
+        if packet is None:
+            self._send_json({"ok": False, "error": "No encoded camera frame is available."}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        _, jpeg = packet
         self.send_response(HTTPStatus.OK)
         self._cors_headers()
         self.send_header("Cache-Control", "no-cache")
@@ -188,8 +211,17 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
+        if length < 0 or length > 1_000_000:
+            raise ValueError("request body must be between 0 and 1000000 bytes")
         body = self.rfile.read(length)
-        return json.loads(body.decode("utf-8") or "{}")
+        payload = json.loads(body.decode("utf-8") or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
+
+    def _send_api_result(self, payload: dict[str, Any]) -> None:
+        status = HTTPStatus.OK if payload.get("ok") else HTTPStatus.BAD_REQUEST
+        self._send_json(payload, status)
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload).encode("utf-8")
@@ -238,15 +270,26 @@ class LiveAnalysisWorker:
             wal_enabled=config.storage.wal_enabled,
         )
         self.detector = DiffDetector.from_config(config.detection)
+        self.yolo = YoloDetector(
+            enabled=config.detection.yolo_enabled,
+            model_name=config.detection.yolo_model,
+            interval_seconds=config.detection.yolo_interval_seconds,
+        )
         self.engine = SeatStateEngine.from_config(config.detection)
         self.engine.restore_statuses(self.store.get_current())
         self._lock = threading.Lock()
+        self._run_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_run = "never"
         self._last_error = ""
         self._last_warning = ""
         self._last_zone_count = 0
+        self._last_yolo_run = "never"
+        self._zones: list[Zone] = []
+        self._decisions: dict[str, SeatDecision] = {}
+        self._evidence: dict[str, ZoneEvidence] = {}
+        self._last_yolo_evidence: dict[str, ZoneEvidence] = {}
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -254,6 +297,11 @@ class LiveAnalysisWorker:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="homebase-camera-analysis", daemon=True)
         self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
 
     def status(self) -> dict[str, object]:
         with self._lock:
@@ -263,13 +311,48 @@ class LiveAnalysisWorker:
                 "last_error": self._last_error,
                 "last_warning": self._last_warning,
                 "zone_count": self._last_zone_count,
+                "last_yolo_run": self._last_yolo_run,
+                "yolo_available": self.yolo.status.available,
+                "yolo_message": self.yolo.status.message,
             }
 
     def current_rows(self) -> list[dict]:
-        return self.store.get_current()
+        with self._lock:
+            return [
+                {
+                    "seat_id": decision.seat_id,
+                    "seat_name": decision.seat_name,
+                    "status": decision.status,
+                    "confidence": decision.confidence,
+                    "evidence": decision.evidence,
+                    "updated_at": decision.updated_at,
+                }
+                for decision in self._decisions.values()
+            ]
 
     def current_status_map(self) -> dict[str, int]:
-        return {str(row["seat_id"]): int(row["status"]) for row in self.store.get_current()}
+        with self._lock:
+            return {seat_id: decision.status for seat_id, decision in self._decisions.items()}
+
+    def current_zones(self) -> list[Zone]:
+        with self._lock:
+            return list(self._zones)
+
+    def capture_baseline(self) -> dict[str, Any]:
+        frame_result = self.capture.latest_frame()
+        if not frame_result.ok:
+            return {"ok": False, "error": frame_result.message}
+        with self._run_lock:
+            saved = self.detector.set_baseline(frame_result.frame, save=True)
+            self.engine.reset()
+            self._last_yolo_evidence = {}
+            with self._lock:
+                self._last_warning = ""
+        return {
+            "ok": True,
+            "path": str(saved) if saved is not None else str(self.detector.baseline_path),
+            "message": "Saved the current empty camera view as the detection baseline.",
+        }
 
     def _loop(self) -> None:
         interval = max(0.5, float(self.config.detection.diff_interval_seconds))
@@ -284,22 +367,125 @@ class LiveAnalysisWorker:
             self._stop.wait(max(0.1, interval - elapsed))
 
     def _run_once(self) -> None:
-        zones = _load_enabled_zones(self.config)
-        frame_result = self.capture.latest_frame()
-        if not zones or not frame_result.ok:
+        with self._run_lock:
+            zones = _load_enabled_zones(self.config)
+            frame_result = self.capture.latest_frame()
+            if not zones or not frame_result.ok:
+                with self._lock:
+                    self._zones = zones
+                    self._decisions = {} if not zones else self._decisions
+                    self._last_zone_count = len(zones)
+                    self._last_error = "" if frame_result.ok else frame_result.message
+                    self._last_run = _now_label()
+                return
+
+            diff_evidence = self.detector.analyze(frame_result.frame, zones)
+            if self.yolo.should_run():
+                self._last_yolo_evidence = self.yolo.detect(frame_result.frame, zones, force=True)
+                self._last_yolo_run = _now_label()
+            evidence = _merge_zone_evidence(diff_evidence, self._last_yolo_evidence)
+            decisions = self.engine.update_all(zones, evidence)
+            self.store.upsert_many(decisions.values())
             with self._lock:
+                self._zones = zones
+                self._decisions = decisions
+                self._evidence = evidence
                 self._last_zone_count = len(zones)
-                self._last_error = "" if frame_result.ok else frame_result.message
+                self._last_error = ""
+                self._last_warning = self.detector.warning or ""
                 self._last_run = _now_label()
+
+
+class LiveFrameProducer:
+    def __init__(self, config: AppConfig, capture: CaptureManager, analyzer: LiveAnalysisWorker) -> None:
+        self.config = config
+        self.capture = capture
+        self.analyzer = analyzer
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._jpeg: bytes | None = None
+        self._sequence = 0
+        self._last_capture_sequence = -1
+        self._last_frame_monotonic = 0.0
+        self._last_encode_ms = 0.0
+        self._last_error = ""
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
             return
-        evidence = self.detector.analyze(frame_result.frame, zones)
-        decisions = self.engine.update_all(zones, evidence)
-        self.store.upsert_many(decisions.values())
-        with self._lock:
-            self._last_zone_count = len(zones)
-            self._last_error = ""
-            self._last_warning = self.detector.warning or ""
-            self._last_run = _now_label()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="homebase-camera-jpeg", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def status(self) -> dict[str, object]:
+        with self._condition:
+            age = None
+            if self._last_frame_monotonic > 0:
+                age = max(0.0, time.monotonic() - self._last_frame_monotonic)
+            return {
+                "running": self._thread is not None and self._thread.is_alive(),
+                "sequence": self._sequence,
+                "frame_age_seconds": age,
+                "last_encode_ms": round(self._last_encode_ms, 1),
+                "last_error": self._last_error,
+            }
+
+    def wait_for_frame(self, after_sequence: int, *, timeout: float) -> tuple[int, bytes] | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while self._jpeg is None or self._sequence <= after_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop.is_set():
+                    return None
+                self._condition.wait(remaining)
+            return self._sequence, self._jpeg
+
+    def _loop(self) -> None:
+        interval = 1.0 / max(1, int(self.config.streaming.fps))
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                if not self.capture.background_running():
+                    self.capture.start_background(self.config.streaming.fps)
+                frame_result = self.capture.latest_frame()
+                capture_sequence = self.capture.latest_sequence()
+                if capture_sequence != self._last_capture_sequence:
+                    zones = self.analyzer.current_zones()
+                    status_map = self.analyzer.current_status_map()
+                    frame = draw_zones(frame_result.frame, zones, status_map) if zones else frame_result.frame
+                    jpeg = _jpeg_bytes(frame, quality=self.config.streaming.jpeg_quality)
+                    encode_ms = (time.monotonic() - started) * 1000
+                    with self._condition:
+                        self._jpeg = jpeg
+                        self._sequence += 1
+                        self._last_capture_sequence = capture_sequence
+                        self._last_frame_monotonic = time.monotonic()
+                        self._last_encode_ms = encode_ms
+                        self._last_error = ""
+                        self._condition.notify_all()
+            except Exception as exc:
+                with self._condition:
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(0.01, interval - elapsed))
+
+
+def _merge_zone_evidence(
+    base: dict[str, ZoneEvidence],
+    update: dict[str, ZoneEvidence],
+) -> dict[str, ZoneEvidence]:
+    merged = dict(base)
+    for seat_id, evidence in update.items():
+        merged[seat_id] = merged.get(seat_id, ZoneEvidence()).merge(evidence)
+    return merged
 
 
 def _now_label() -> str:
@@ -331,14 +517,6 @@ def _jpeg_bytes(frame: Any, *, quality: int) -> bytes:
     output = BytesIO()
     image.save(output, format="JPEG", quality=int(quality), optimize=False)
     return output.getvalue()
-
-
-def _frame_with_overlay(config: AppConfig, capture: CaptureManager, analyzer: LiveAnalysisWorker) -> Any:
-    frame = capture.latest_frame().frame
-    zones = _load_enabled_zones(config)
-    if not zones:
-        return frame
-    return draw_zones(frame, zones, analyzer.current_status_map())
 
 
 def _load_enabled_zones(config: AppConfig) -> list[Zone]:
@@ -373,18 +551,34 @@ def _save_zone_payload(config: AppConfig, payload: dict[str, Any]) -> dict[str, 
     seat_id = str(payload.get("seat_id", "")).strip()
     seat_name = str(payload.get("seat_name", "")).strip() or seat_id
     enabled = bool(payload.get("enabled", True))
-    polygon = _parse_polygon(payload.get("polygon"))
+    try:
+        polygon = _parse_polygon(payload.get("polygon"))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if not seat_id:
         return {"ok": False, "error": "seat_id is required."}
     if len(polygon) < 3:
         return {"ok": False, "error": "polygon must contain at least three points."}
 
     target_path = _target_path(config, target)
-    existing = _load_existing_zones(config, target)
-    updated = [zone for zone in existing if zone.seat_id != seat_id]
-    updated.append(Zone(seat_id=seat_id, seat_name=seat_name, polygon=tuple(polygon), enabled=enabled))
-    saved = save_zones(updated, target_path)
-    return {"ok": True, "path": str(saved), "zones": [zone.to_json() for zone in updated]}
+    try:
+        with _ZONE_WRITE_LOCK:
+            existing = _load_existing_zones(config, target)
+            updated = [zone for zone in existing if zone.seat_id != seat_id]
+            updated.append(Zone(seat_id=seat_id, seat_name=seat_name, polygon=tuple(polygon), enabled=enabled))
+            saved = save_zones(updated, target_path)
+    except (OSError, ZoneConfigError) as exc:
+        return {"ok": False, "error": f"Could not save zones: {exc}"}
+    warnings = validate_zones(
+        updated,
+        (config.camera.frame_height, config.camera.frame_width, 3),
+    )
+    return {
+        "ok": True,
+        "path": str(saved),
+        "zones": [zone.to_json() for zone in updated],
+        "warnings": [f"{warning.seat_id}: {warning.message}" for warning in warnings],
+    }
 
 
 def _delete_zone_payload(config: AppConfig, payload: dict[str, Any]) -> dict[str, Any]:
@@ -393,8 +587,15 @@ def _delete_zone_payload(config: AppConfig, payload: dict[str, Any]) -> dict[str
     if not seat_id:
         return {"ok": False, "error": "seat_id is required."}
     target_path = _target_path(config, target)
-    updated = [zone for zone in _load_existing_zones(config, target) if zone.seat_id != seat_id]
-    saved = save_zones(updated, target_path)
+    try:
+        with _ZONE_WRITE_LOCK:
+            existing = _load_existing_zones(config, target)
+            if not any(zone.seat_id == seat_id for zone in existing):
+                return {"ok": False, "error": f"Zone '{seat_id}' was not found."}
+            updated = [zone for zone in existing if zone.seat_id != seat_id]
+            saved = save_zones(updated, target_path)
+    except (OSError, ZoneConfigError) as exc:
+        return {"ok": False, "error": f"Could not delete zone: {exc}"}
     return {"ok": True, "path": str(saved), "zones": [zone.to_json() for zone in updated]}
 
 
@@ -407,17 +608,103 @@ def _load_existing_zones(config: AppConfig, target: str) -> list[Zone]:
 
 
 def _parse_polygon(value: Any) -> list[tuple[int, int]]:
-    points: list[tuple[int, int]] = []
     if not isinstance(value, list):
-        return points
-    for item in value:
+        raise ValueError("polygon must be a list of [x, y] points.")
+    points: list[tuple[int, int]] = []
+    for index, item in enumerate(value):
         if not isinstance(item, list | tuple) or len(item) != 2:
-            continue
+            raise ValueError(f"polygon[{index}] must be [x, y].")
         try:
             points.append((int(round(float(item[0]))), int(round(float(item[1])))))
-        except (TypeError, ValueError):
-            continue
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"polygon[{index}] must contain finite numbers.") from exc
     return points
+
+
+def _status_panel_html() -> str:
+    return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homebase Live Status</title>
+<style>
+:root { color-scheme: light; font-family: Arial, sans-serif; }
+body { margin: 0; color: #0f172a; background: white; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid #cbd5e1; }
+#health { font-size: 12px; color: #475569; }
+#warning { display: none; margin: 10px 12px 0; padding: 8px; background: #fff7ed; color: #9a3412; border: 1px solid #fdba74; font-size: 12px; }
+#rows { display: grid; gap: 8px; padding: 10px 12px 12px; }
+.seat { border: 1px solid #cbd5e1; border-left: 7px solid #64748b; padding: 9px 10px; }
+.seat-top { display: flex; justify-content: space-between; gap: 10px; font-weight: 700; }
+.label { margin-top: 3px; color: #334155; font-size: 13px; }
+.meta { margin-top: 4px; color: #64748b; font-size: 11px; overflow-wrap: anywhere; }
+.empty { color: #64748b; padding: 12px; }
+</style>
+</head>
+<body>
+<header><strong>Live Seat Status</strong><span id="health">connecting</span></header>
+<div id="warning"></div>
+<div id="rows"><div class="empty">Waiting for analysis...</div></div>
+<script>
+const colors = {0:'#16a34a', 1:'#dc2626', 2:'#d97706'};
+const labels = {0:'Empty', 1:'Person', 2:'Temporarily left / object'};
+
+async function refresh() {
+  try {
+    const [statusRes, healthRes] = await Promise.all([fetch('/api/status'), fetch('/health')]);
+    if (!statusRes.ok || !healthRes.ok) throw new Error(`HTTP ${statusRes.status}/${healthRes.status}`);
+    const data = await statusRes.json();
+    const health = await healthRes.json();
+    const rows = data.current || [];
+    const container = document.getElementById('rows');
+    container.textContent = '';
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No enabled seat zones.';
+      container.appendChild(empty);
+    }
+    rows.forEach(row => {
+      const seat = document.createElement('div');
+      seat.className = 'seat';
+      seat.style.borderLeftColor = colors[row.status] || '#64748b';
+      const top = document.createElement('div');
+      top.className = 'seat-top';
+      const name = document.createElement('span');
+      name.textContent = row.seat_name || row.seat_id;
+      const value = document.createElement('span');
+      value.textContent = `status ${row.status}`;
+      value.style.color = colors[row.status] || '#64748b';
+      top.append(name, value);
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = `${labels[row.status] || 'Unknown'} / confidence ${Number(row.confidence || 0).toFixed(2)}`;
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = row.evidence || '';
+      seat.append(top, label, meta);
+      container.appendChild(seat);
+    });
+    const captureAge = Number(health.frame_age_seconds || 0);
+    document.getElementById('health').textContent = `frame ${captureAge.toFixed(2)}s / analysis ${data.analysis.last_run || 'never'}`;
+    const warning = document.getElementById('warning');
+    const message = data.analysis.last_error || data.analysis.last_warning || health.stream.last_error || health.capture.last_error || '';
+    warning.textContent = message;
+    warning.style.display = message ? 'block' : 'none';
+  } catch (err) {
+    document.getElementById('health').textContent = 'disconnected';
+    const warning = document.getElementById('warning');
+    warning.textContent = `Live status unavailable: ${err}`;
+    warning.style.display = 'block';
+  }
+}
+setInterval(refresh, 1000);
+refresh();
+</script>
+</body>
+</html>
+"""
 
 
 def _zone_editor_html() -> str:
@@ -472,6 +759,9 @@ button.danger { background: #991b1b; border-color: #991b1b; }
       <button id="save">Save polygon</button>
       <button class="secondary" id="undo">Undo point</button>
       <button class="secondary" id="clear">Clear</button>
+    </div>
+    <div class="row">
+      <button class="secondary" id="baseline">Set empty baseline</button>
     </div>
     <div id="status"></div>
     <div id="currentStatus" class="statuses"></div>
@@ -546,12 +836,17 @@ function setStatus(text) {
 }
 
 async function loadZones() {
-  const target = document.getElementById('target').value;
-  const res = await fetch(`/api/zones?target=${encodeURIComponent(target)}`);
-  const data = await res.json();
-  zones = data.zones || [];
-  renderZones();
-  draw();
+  try {
+    const target = document.getElementById('target').value;
+    const res = await fetch(`/api/zones?target=${encodeURIComponent(target)}`);
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    zones = data.zones || [];
+    renderZones();
+    draw();
+  } catch (err) {
+    setStatus(`Could not load zones: ${err}`);
+  }
 }
 
 async function loadStatus() {
@@ -605,13 +900,20 @@ function renderZones() {
     del.className = 'danger';
     del.textContent = 'Delete';
     del.onclick = async () => {
-      await fetch('/api/delete-zone', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({target: document.getElementById('target').value, seat_id: zone.seat_id})
-      });
-      setStatus(`Deleted ${zone.seat_id}`);
-      await loadZones();
+      if (!window.confirm(`Delete ${zone.seat_id}?`)) return;
+      try {
+        const res = await fetch('/api/delete-zone', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({target: document.getElementById('target').value, seat_id: zone.seat_id})
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        setStatus(`Deleted ${zone.seat_id}`);
+        await loadZones();
+      } catch (err) {
+        setStatus(`Delete failed: ${err}`);
+      }
     };
     actions.append(edit, del);
     row.append(name, actions);
@@ -626,6 +928,21 @@ canvas.addEventListener('click', event => {
 document.getElementById('undo').onclick = () => { points.pop(); draw(); };
 document.getElementById('clear').onclick = () => { points = []; draw(); };
 document.getElementById('target').onchange = loadZones;
+document.getElementById('baseline').onclick = async () => {
+  if (!window.confirm('Use the current empty camera view as the detection baseline?')) return;
+  try {
+    const res = await fetch('/api/baseline', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    setStatus(data.message || 'Baseline saved.');
+  } catch (err) {
+    setStatus(`Baseline save failed: ${err}`);
+  }
+};
 document.getElementById('save').onclick = async () => {
   if (points.length < 3) {
     setStatus('Draw at least three points.');
@@ -638,14 +955,20 @@ document.getElementById('save').onclick = async () => {
     enabled: document.getElementById('enabled').checked,
     polygon: points
   };
-  const res = await fetch('/api/zones', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  setStatus(data.ok ? `Saved ${payload.seat_id}` : data.error);
-  await loadZones();
+  try {
+    const res = await fetch('/api/zones', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const warnings = (data.warnings || []).join(' ');
+    setStatus(`Saved ${payload.seat_id}${warnings ? '. ' + warnings : ''}`);
+    await loadZones();
+  } catch (err) {
+    setStatus(`Save failed: ${err}`);
+  }
 };
 img.onload = resizeCanvas;
 window.addEventListener('resize', resizeCanvas);

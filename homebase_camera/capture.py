@@ -32,6 +32,10 @@ class CaptureManager:
         self._background_thread: threading.Thread | None = None
         self._latest_result: FrameResult | None = None
         self._latest_monotonic = 0.0
+        self._latest_sequence = 0
+        self._background_frame_count = 0
+        self._background_failure_count = 0
+        self._background_error = ""
         self._last_snapshot_save_monotonic = 0.0
         self.last_message = ""
 
@@ -53,7 +57,12 @@ class CaptureManager:
         with self._latest_lock:
             self._latest_result = result
             self._latest_monotonic = time.monotonic()
+            self._latest_sequence += 1
         return result
+
+    def latest_sequence(self) -> int:
+        with self._latest_lock:
+            return self._latest_sequence
 
     def frame_age_seconds(self) -> float | None:
         with self._latest_lock:
@@ -95,13 +104,42 @@ class CaptureManager:
     def background_running(self) -> bool:
         return self._background_thread is not None and self._background_thread.is_alive()
 
+    def background_status(self) -> dict[str, object]:
+        with self._latest_lock:
+            return {
+                "running": self.background_running(),
+                "frame_count": self._background_frame_count,
+                "failure_count": self._background_failure_count,
+                "last_error": self._background_error,
+                "latest_sequence": self._latest_sequence,
+            }
+
     def _background_loop(self, interval: float) -> None:
         while not self._background_stop.is_set():
             started = time.monotonic()
-            result = self.refresh_latest_once()
+            try:
+                result = self.refresh_latest_once()
+            except Exception as exc:
+                message = f"Background capture failed: {type(exc).__name__}: {exc}"
+                result = self._placeholder(message, ok=False)
+                with self._latest_lock:
+                    self._latest_result = result
+                    self._latest_monotonic = time.monotonic()
+                    self._latest_sequence += 1
+                    self._background_failure_count += 1
+                    self._background_error = message
+            else:
+                with self._latest_lock:
+                    self._background_frame_count += 1
+                    if result.ok:
+                        self._background_error = ""
+                    else:
+                        self._background_failure_count += 1
+                        self._background_error = result.message
             self.last_message = result.message
             elapsed = time.monotonic() - started
-            self._background_stop.wait(max(0.01, interval - elapsed))
+            retry_interval = interval if result.ok else max(interval, 0.5)
+            self._background_stop.wait(max(0.01, retry_interval - elapsed))
 
     def _read_frame_locked(self) -> FrameResult:
         source = self.camera_config.source.lower()

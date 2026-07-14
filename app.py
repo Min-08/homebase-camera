@@ -52,9 +52,10 @@ def main() -> None:
     for warning in config.warnings:
         st.info(warning)
 
-    runtime_detection, ui_state = _sidebar_controls(config, demo_mode)
     stream_info = _start_live_stream(config, demo_mode)
-    refresh_count = _auto_refresh(ui_state)
+    live_mode = stream_info is not None and not demo_mode
+    runtime_detection, ui_state = _sidebar_controls(config, demo_mode, live_mode=live_mode)
+    refresh_count = _auto_refresh(ui_state, live_mode=live_mode)
     demo_step = _demo_controls(config, demo_mode, refresh_count, ui_state)
 
     zones, editor_zones, zone_source = _load_zone_sets(config, demo_mode)
@@ -85,14 +86,19 @@ def main() -> None:
         _settings_tab(config, runtime_detection, ui_state, demo_mode)
 
 
-def _sidebar_controls(config: AppConfig, demo_mode: bool):
+def _sidebar_controls(config: AppConfig, demo_mode: bool, *, live_mode: bool):
     st.sidebar.header("Runtime Controls")
-    auto_refresh = st.sidebar.toggle("Auto-refresh", value=bool(config.ui.auto_refresh_enabled))
+    auto_refresh = st.sidebar.toggle(
+        "Auto-refresh",
+        value=bool(config.ui.auto_refresh_enabled),
+        disabled=live_mode,
+    )
     refresh_interval = st.sidebar.slider(
         "Refresh interval seconds",
         min_value=1,
         max_value=30,
         value=int(config.ui.refresh_interval_seconds),
+        disabled=live_mode,
     )
     manual_refresh = st.sidebar.button("Manual refresh")
     if manual_refresh:
@@ -102,12 +108,13 @@ def _sidebar_controls(config: AppConfig, demo_mode: bool):
     yolo_enabled = st.sidebar.toggle(
         "YOLO correction",
         value=False if demo_mode else bool(config.detection.yolo_enabled),
-        disabled=demo_mode,
-        help="Disabled in PC demo mode. Demo evidence is generated, not YOLO output.",
+        disabled=demo_mode or live_mode,
+        help="Demo evidence is generated without YOLO. Live mode reads this setting from config/settings.toml.",
     )
     object_enabled = st.sidebar.toggle(
         "Object occupancy",
         value=bool(config.detection.object_occupancy_enabled),
+        disabled=live_mode,
         help="When disabled, status 2 is never published.",
     )
     conservativeness = st.sidebar.slider(
@@ -115,10 +122,13 @@ def _sidebar_controls(config: AppConfig, demo_mode: bool):
         min_value=0,
         max_value=10,
         value=int(config.detection.object_conservativeness),
+        disabled=live_mode,
         help="0 triggers status 2 easily; 10 requires stronger repeated evidence.",
     )
     st.sidebar.metric("YOLO interval", f"{config.detection.yolo_interval_seconds}s")
     st.sidebar.metric("Diff interval target", f"{config.detection.diff_interval_seconds}s")
+    if live_mode:
+        st.sidebar.caption("Live analysis uses config/settings.toml. Restart the service after changing detection settings.")
 
     runtime_detection = replace(
         config.detection,
@@ -134,7 +144,10 @@ def _sidebar_controls(config: AppConfig, demo_mode: bool):
     return runtime_detection, ui_state
 
 
-def _auto_refresh(ui_state: dict[str, Any]) -> int:
+def _auto_refresh(ui_state: dict[str, Any], *, live_mode: bool = False) -> int:
+    if live_mode:
+        st.sidebar.caption("Live video and seat status update without refreshing the whole dashboard.")
+        return int(st.session_state.get("auto_refresh_count", 0))
     if not ui_state["auto_refresh"]:
         return int(st.session_state.get("auto_refresh_count", 0))
     try:
@@ -246,7 +259,8 @@ def _monitor_tab(
     stream_info: StreamServerInfo | None,
 ) -> None:
     if stream_info is not None:
-        _live_stream_panel(stream_info)
+        _live_monitor(stream_info, zones)
+        return
 
     if not zones:
         st.info("No enabled zones are configured yet. Open Zone Editor or run tools/zone_editor_cv.py.")
@@ -304,6 +318,25 @@ def _live_stream_panel(stream_info: StreamServerInfo) -> None:
     )
     st.caption(f"Live stream: {stream_info.stream_url}")
     st.link_button("Open live zone editor", stream_info.zone_editor_url)
+
+
+def _live_monitor(stream_info: StreamServerInfo, zones: list[Zone]) -> None:
+    left, right = st.columns([1.8, 1], gap="large")
+    with left:
+        _live_stream_panel(stream_info)
+    with right:
+        st.subheader("Live Seat Status")
+        st.markdown(
+            f"""
+            <iframe
+              src="{stream_info.status_panel_url}"
+              style="width:100%;height:560px;border:1px solid #cbd5e1;background:white"
+              title="Homebase live seat status"></iframe>
+            """,
+            unsafe_allow_html=True,
+        )
+    if not zones:
+        st.info("No enabled zones are configured yet. Open Zone Editor to draw the first seat zone.")
 
 
 def _run_analysis(
@@ -424,17 +457,18 @@ def _zone_editor_tab(
 ) -> None:
     st.subheader("Zone Editor")
     if stream_info is not None:
-        st.info("Use the live editor below to draw zones directly on the camera stream.")
         st.link_button("Open live zone editor in a new tab", stream_info.zone_editor_url)
-        st.markdown(
-            f"""
-            <iframe
-              src="{stream_info.zone_editor_url}"
-              style="width:100%;height:760px;border:1px solid #cbd5e1;background:white"
-              title="Homebase live zone editor"></iframe>
-            """,
-            unsafe_allow_html=True,
-        )
+        embed_editor = st.toggle("Show editor in dashboard", value=False, key="embed_live_zone_editor")
+        if embed_editor:
+            st.markdown(
+                f"""
+                <iframe
+                  src="{stream_info.zone_editor_url}"
+                  style="width:100%;height:760px;border:1px solid #cbd5e1;background:white"
+                  title="Homebase live zone editor"></iframe>
+                """,
+                unsafe_allow_html=True,
+            )
         return
 
     if not zones:
