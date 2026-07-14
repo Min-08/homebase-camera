@@ -66,12 +66,42 @@ source .venv/bin/activate
 
 python -m pip install --upgrade pip setuptools wheel
 if ! python -m pip install -r requirements.txt; then
-  echo "Python dependency installation failed."
-  echo "If OpenCV or camera packages are missing on Raspberry Pi OS, run:"
-  echo "  sudo apt update"
-  echo "  sudo apt install python3-picamera2 python3-opencv"
-  echo "Then run ./setup_raspberry_pi.sh again."
-  exit 1
+  PYARROW_FALLBACK_OK="$(python - <<'PY'
+import platform
+import sys
+import sysconfig
+
+platform_tag = sysconfig.get_platform().lower()
+machine = platform.machine().lower()
+is_armhf = (
+    "armv7" in platform_tag
+    or "arm-linux-gnueabihf" in platform_tag
+    or "armhf" in platform_tag
+    or "armv7" in machine
+)
+print("1" if sys.version_info >= (3, 13) and is_armhf else "0")
+PY
+)"
+  if [[ "$PYARROW_FALLBACK_OK" == "1" ]]; then
+    echo ""
+    echo "Full dependency installation failed on 32-bit Raspberry Pi Python 3.13."
+    echo "PyArrow wheels are often unavailable for this platform, so installing a dashboard fallback set."
+    python -m pip install --no-cache-dir \
+      altair cachetools click gitpython pandas pydeck protobuf tenacity toml watchdog \
+      anyio httptools itsdangerous python-multipart starlette uvicorn websockets requests \
+      pytest narwhals gitdb smmap h11 pluggy iniconfig
+    python -m pip install --no-cache-dir --no-deps \
+      "streamlit>=1.31" "streamlit-autorefresh>=1.0.1" "streamlit-drawable-canvas>=0.9.3"
+    echo "Installed fallback Python dependencies without PyArrow."
+    echo "Auto-refresh and table widgets will degrade gracefully if PyArrow is unavailable."
+  else
+    echo "Python dependency installation failed."
+    echo "If OpenCV or camera packages are missing on Raspberry Pi OS, run:"
+    echo "  sudo apt update"
+    echo "  sudo apt install python3-picamera2 python3-opencv"
+    echo "Then run ./setup_raspberry_pi.sh again."
+    exit 1
+  fi
 fi
 
 if [[ ! -f "config/settings.toml" ]]; then

@@ -141,12 +141,16 @@ def _auto_refresh(ui_state: dict[str, Any]) -> int:
         st.sidebar.warning(f"Auto-refresh package is unavailable: {exc}")
         return int(st.session_state.get("auto_refresh_count", 0))
 
-    count = int(
-        st_autorefresh(
-            interval=max(1, int(ui_state["refresh_interval"])) * 1000,
-            key="homebase_auto_refresh",
+    try:
+        count = int(
+            st_autorefresh(
+                interval=max(1, int(ui_state["refresh_interval"])) * 1000,
+                key="homebase_auto_refresh",
+            )
         )
-    )
+    except Exception as exc:
+        st.sidebar.warning(f"Auto-refresh component is unavailable: {exc}")
+        return int(st.session_state.get("auto_refresh_count", 0))
     st.session_state.auto_refresh_count = count
     return count
 
@@ -494,14 +498,33 @@ def _existing_zone_editor(zones: list[Zone], target_path: str | Path) -> None:
 def _logs_tab(config: AppConfig) -> None:
     store = _store(config)
     st.subheader("Current Status")
-    st.dataframe(store.get_current(), width="stretch", hide_index=True)
+    _safe_dataframe(store.get_current(), empty_message="No current status has been recorded yet.")
 
     st.subheader("Status Change Log")
-    st.dataframe(store.get_log(limit=200), width="stretch", hide_index=True)
+    _safe_dataframe(store.get_log(limit=200), empty_message="No status changes have been recorded yet.")
     if st.button("Reset Status Log"):
         store.reset_logs()
         st.success("Status log cleared.")
         st.rerun()
+
+
+def _safe_dataframe(records: list[dict], *, empty_message: str) -> None:
+    if not records:
+        st.caption(empty_message)
+        return
+    try:
+        st.dataframe(records, width="stretch", hide_index=True)
+    except Exception as exc:
+        if not _is_pyarrow_unavailable(exc):
+            raise
+        st.warning("Table view requires PyArrow on this platform. Showing JSON fallback.")
+        st.json(records, expanded=False)
+
+
+def _is_pyarrow_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, ModuleNotFoundError) and exc.name == "pyarrow":
+        return True
+    return "pyarrow" in str(exc).lower()
 
 
 def _settings_tab(config: AppConfig, runtime_detection, ui_state: dict[str, Any], demo_mode: bool) -> None:
