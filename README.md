@@ -26,6 +26,14 @@ chmod +x setup_raspberry_pi.sh run_app.sh run_mock.sh
 
 Open the dashboard on the Raspberry Pi at `http://localhost:8501`. From another device on the same network, open `http://<raspberry-pi-ip>:8501`.
 
+Real mode also exposes a shared live service on port `8502`:
+
+```text
+http://<raspberry-pi-ip>:8502/stream.mjpg
+http://<raspberry-pi-ip>:8502/zone-editor
+http://<raspberry-pi-ip>:8502/health
+```
+
 If you copied the folder manually instead of using `git clone`, open a terminal in the copied `homebase-camera` folder and run the same commands.
 
 To also install Raspberry Pi OS camera/system packages during setup, run:
@@ -104,21 +112,15 @@ python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```text
 [OV5647 camera / generated demo frame / mock image]
         |
-[Picamera2, OpenCV, or demo capture]
+[Single background capture manager]
         |
-[Dynamic polygon zones from seats JSON]
+[Interval-gated diff + optional YOLO analysis worker]
         |
-[Interval-gated pixel difference detector]
+[SQLite current status + change log]
         |
-[Optional interval-gated YOLO correction]
+[One shared overlay/JPEG producer]
         |
-[Demo evidence injection in PC demo mode]
-        |
-[State smoothing and conservative decision logic]
-        |
-[SQLite current_status + status_log]
-        |
-[Streamlit dashboard + zone editor]
+[MJPEG stream + live status + zone editor + Streamlit dashboard]
 ```
 
 ## Auto-Refresh and Intervals
@@ -144,12 +146,16 @@ diff_interval_seconds = 3
 yolo_interval_seconds = 20
 ```
 
-The dashboard reruns at the refresh interval, but detector work is separately gated:
+In Raspberry Pi live mode, camera video and seat status update independently without rerunning the whole Streamlit dashboard. Detection settings come from `config/settings.toml`; restart the service or app after editing them. This keeps multiple browser tabs from duplicating camera analysis and JPEG encoding.
+
+In demo/mock mode, the dashboard reruns at the refresh interval, but detector work is separately gated:
 
 - `diff_interval_seconds` controls when pixel-diff analysis runs.
 - `yolo_interval_seconds` controls when YOLO analysis runs.
 - If a detector is not due yet, the app reuses the last evidence/status instead of advancing smoothing on every rerun.
 - The monitor shows last diff run time and last YOLO run time.
+
+The real-mode live status panel shows current analysis time, frame age, warnings, and seat states.
 
 ## PC Mapping Demo
 
@@ -239,6 +245,8 @@ python tools/capture_baseline.py --mock
 
 If no baseline exists, the app uses the first frame as a temporary baseline and shows a warning.
 
+In real mode, open `http://<raspberry-pi-ip>:8502/zone-editor` and press **Set empty baseline** while every seat zone is empty. This saves `data/snapshots/baseline.jpg` without stopping the stream.
+
 ## Raspberry Pi Camera Troubleshooting
 
 Install camera dependencies on Raspberry Pi OS:
@@ -256,7 +264,7 @@ If the camera is not detected:
 - Confirm the camera works with Raspberry Pi OS camera tools.
 - Use `./run_mock.sh` or `./run_demo.sh` to verify the app without hardware.
 
-Multi-session note: capture resources are cached to reduce duplicate camera opens, but one dashboard operator is still recommended on Raspberry Pi.
+Multiple browser clients share one capture, analysis, overlay, and JPEG pipeline. Do not run two separate Homebase Camera processes at the same time because only one process can own the Picamera2 device.
 
 ## YOLO Notes and License Caution
 
@@ -311,7 +319,8 @@ For real shared spaces, use high-angle/top-view placement where possible and pos
 - Pixel difference is sensitive to lighting and camera movement.
 - YOLO on Raspberry Pi 4B can be slow; use long intervals.
 - State smoothing history is restored from the latest SQLite status, but hit counters are still approximate after restart.
-- Multi-session camera safety is improved with a cached resource, but Raspberry Pi camera hardware is still best used from one dashboard session at a time.
+- A hard hang inside a camera driver call may still require a systemd service restart.
+- Diff-only mode reports a changed hand/object as status `2`; status `1` requires YOLO person evidence or demo evidence.
 
 ## Development
 

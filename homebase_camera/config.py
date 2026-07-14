@@ -153,6 +153,7 @@ def load_settings(path: str | Path | None = None) -> AppConfig:
         demo = replace(demo, enabled=True)
         camera = replace(camera, source="demo")
         detection = replace(detection, yolo_enabled=False)
+    camera = _validate_camera(camera)
 
     return AppConfig(
         project_root=root,
@@ -183,61 +184,112 @@ def _build_dataclass(default_obj: Any, section: dict[str, Any], section_name: st
 
 
 def _validate_detection(config: DetectionConfig) -> DetectionConfig:
-    try:
-        conservativeness = int(config.object_conservativeness)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("object_conservativeness must be an integer from 0 to 10.") from exc
+    conservativeness = _as_int(config.object_conservativeness, "object_conservativeness")
+    yolo_interval = _as_int(config.yolo_interval_seconds, "yolo_interval_seconds")
+    diff_interval = _as_int(config.diff_interval_seconds, "diff_interval_seconds")
+    empty_hits = _as_int(config.empty_required_hits, "empty_required_hits")
+    person_hits = _as_int(config.person_required_hits, "person_required_hits")
+    diff_threshold = _as_int(config.diff_threshold, "diff_threshold")
+    change_ratio = _as_float(config.change_ratio_threshold, "change_ratio_threshold")
 
     if not 0 <= conservativeness <= 10:
         raise ConfigError("object_conservativeness must be between 0 and 10.")
 
-    if config.yolo_interval_seconds < 1:
+    if yolo_interval < 1:
         raise ConfigError("yolo_interval_seconds must be at least 1.")
-    if config.diff_interval_seconds < 1:
+    if diff_interval < 1:
         raise ConfigError("diff_interval_seconds must be at least 1.")
-    if config.empty_required_hits < 1 or config.person_required_hits < 1:
+    if empty_hits < 1 or person_hits < 1:
         raise ConfigError("empty_required_hits and person_required_hits must be at least 1.")
-    if not 0 < float(config.change_ratio_threshold) <= 1:
+    if not 0 <= diff_threshold <= 255:
+        raise ConfigError("diff_threshold must be between 0 and 255.")
+    if not 0 < change_ratio <= 1:
         raise ConfigError("change_ratio_threshold must be greater than 0 and less than or equal to 1.")
 
-    return replace(config, object_conservativeness=conservativeness)
+    return replace(
+        config,
+        object_conservativeness=conservativeness,
+        yolo_interval_seconds=yolo_interval,
+        diff_interval_seconds=diff_interval,
+        empty_required_hits=empty_hits,
+        person_required_hits=person_hits,
+        diff_threshold=diff_threshold,
+        change_ratio_threshold=change_ratio,
+    )
+
+
+def _validate_camera(config: CameraConfig) -> CameraConfig:
+    source = str(config.source).strip().lower()
+    if source not in {"picamera2", "opencv", "usb", "video", "demo", "mock"}:
+        raise ConfigError("camera.source must be picamera2, opencv, usb, video, demo, or mock.")
+    device_index = _as_int(config.device_index, "camera.device_index")
+    width = _as_int(config.frame_width, "camera.frame_width")
+    height = _as_int(config.frame_height, "camera.frame_height")
+    if not 16 <= width <= 8192 or not 16 <= height <= 8192:
+        raise ConfigError("camera frame_width and frame_height must be between 16 and 8192.")
+    return replace(config, source=source, device_index=device_index, frame_width=width, frame_height=height)
 
 
 def _validate_ui(config: UIConfig) -> UIConfig:
-    if int(config.refresh_interval_seconds) < 1:
+    refresh_interval = _as_int(config.refresh_interval_seconds, "refresh_interval_seconds")
+    if refresh_interval < 1:
         raise ConfigError("refresh_interval_seconds must be at least 1.")
-    return replace(config, refresh_interval_seconds=int(config.refresh_interval_seconds))
+    return replace(config, refresh_interval_seconds=refresh_interval)
 
 
 def _validate_storage(config: StorageConfig) -> StorageConfig:
-    if int(config.timeout_seconds) < 1:
+    timeout = _as_int(config.timeout_seconds, "storage.timeout_seconds")
+    busy_timeout = _as_int(config.busy_timeout_ms, "storage.busy_timeout_ms")
+    if timeout < 1:
         raise ConfigError("timeout_seconds must be at least 1.")
-    if int(config.busy_timeout_ms) < 100:
+    if busy_timeout < 100:
         raise ConfigError("busy_timeout_ms must be at least 100.")
     return replace(
         config,
-        timeout_seconds=int(config.timeout_seconds),
-        busy_timeout_ms=int(config.busy_timeout_ms),
+        timeout_seconds=timeout,
+        busy_timeout_ms=busy_timeout,
     )
 
 
 def _validate_privacy(config: PrivacyConfig) -> PrivacyConfig:
-    if int(config.snapshot_interval_seconds) < 1:
+    snapshot_interval = _as_int(config.snapshot_interval_seconds, "privacy.snapshot_interval_seconds")
+    if snapshot_interval < 1:
         raise ConfigError("snapshot_interval_seconds must be at least 1.")
-    return replace(config, snapshot_interval_seconds=int(config.snapshot_interval_seconds))
+    return replace(config, snapshot_interval_seconds=snapshot_interval)
 
 
 def _validate_streaming(config: StreamingConfig) -> StreamingConfig:
-    port = int(config.port)
-    fps = int(config.fps)
-    jpeg_quality = int(config.jpeg_quality)
+    port = _as_int(config.port, "streaming.port")
+    fps = _as_int(config.fps, "streaming.fps")
+    jpeg_quality = _as_int(config.jpeg_quality, "streaming.jpeg_quality")
+    host = str(config.host).strip()
+    if not host:
+        raise ConfigError("streaming.host must not be empty.")
     if not 1 <= port <= 65535:
         raise ConfigError("streaming.port must be between 1 and 65535.")
     if not 1 <= fps <= 30:
         raise ConfigError("streaming.fps must be between 1 and 30.")
     if not 40 <= jpeg_quality <= 95:
         raise ConfigError("streaming.jpeg_quality must be between 40 and 95.")
-    return replace(config, port=port, fps=fps, jpeg_quality=jpeg_quality)
+    return replace(config, host=host, port=port, fps=fps, jpeg_quality=jpeg_quality)
+
+
+def _as_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} must be an integer.")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be an integer.") from exc
+
+
+def _as_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} must be a number.")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a number.") from exc
 
 
 def _display_path(path: Path, root: Path) -> str:

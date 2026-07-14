@@ -1,156 +1,153 @@
 # Raspberry Pi Simulation and Reliability Report
 
-Date: 2026-07-07
+Date: 2026-07-15
 
 Repository: `https://github.com/Min-08/homebase-camera/tree/main`
 
-Environment used for simulation:
+## Environments
 
-- Windows workstation, Python 3.13.8
-- Standard CPython 3.13.8 for final PC setup verification
-- A free-threaded CPython 3.13 interpreter was also present through `py -3` and was used to simulate dependency setup failure
-- No Raspberry Pi 4 Model B hardware available
-- No OV5647 camera module available
-- No Picamera2 package available on this workstation
-- No Ultralytics YOLO package or model installed
+- Windows workstation: Python 3.13.8, PowerShell, browser automation
+- Raspberry Pi 4 Model B: 8 GB RAM, Raspbian GNU/Linux 13 (trixie), Python 3.13.5
+- Camera: OV5647 detected by libcamera at `/base/soc/i2c0mux/i2c@1/ov5647@36`
+- Camera stream under test: 1280x720 RGB888, 10 FPS target, JPEG quality 75
+- Raspberry Pi service: `homebase-camera.service`, Streamlit on ports 8501 and 8502
+- YOLO: disabled on the Pi; Ultralytics missing/failure paths were simulated
 
-The real Raspberry Pi camera path could not be physically verified. This pass used static review, unit tests, mock capture, demo mode assets, synthetic baseline scenarios, missing dependency simulation, launcher review, and command execution where practical.
+This pass combined code review, unit/integration tests, synthetic images, SQLite retry tests, shell checks, actual Raspberry Pi execution, live camera measurements, four-client streaming load, and browser interaction with the deployed dashboard and zone editor.
 
-## Summary
+## Outcome
 
-The app already had defensive behavior for many missing hardware paths: Picamera2 absence returns a placeholder frame and warning, YOLO absence keeps the app in diff-only mode, SQLite enables WAL/busy timeout, and demo mode can exercise statuses `0`, `1`, and `2`.
+The camera, analysis worker, database, dashboard, live status panel, and zone editor are operational on the real Raspberry Pi. The main live-video defect was per-client work: every MJPEG connection independently loaded zones, read SQLite, drew overlays, and encoded JPEG. With several old dashboard/editor tabs open, the Pi used about 186 percent of one CPU core and delivered about 3 FPS despite a 10 FPS setting.
 
-The main confirmed defect was demo asset generation safety. `tools/generate_demo_assets.py` overwrote `demo/demo_seats.json`, `demo/demo_timeline.json`, and frames on every run, which could erase user-edited mapping files. This is now fixed: default generation only creates missing assets, and `--force` is required for intentional reset.
+The live path now captures once, analyzes once, renders/encodes once, and distributes the cached JPEG to every client. Real mode no longer reruns Streamlit for each camera/status refresh. A later frame-sequence defect found during deployment testing was fixed before final verification.
 
-Additional hardening improved baseline diagnostics, camera handle reset after capture failure, Windows venv validation, dependency compatibility on Python 3.13, SQLite startup concurrency, Raspberry Pi setup guidance, and missing-zone-file messages.
+An empty 1280x720 baseline was captured from the deployed zone editor. Pi-specific detection settings were tuned to a 1-second diff interval, one required object hit, one required empty hit, and a 0.015 changed-pixel threshold.
+
+## Live Performance
+
+| Measurement | Before | Final single probe | Four concurrent clients |
+|---|---:|---:|---:|
+| Delivered MJPEG FPS | 3.03 | 9.61 | 8.78 each |
+| Process CPU, one core = 100% | 186.2% | 101.5% | 96.7% |
+| Snapshot latency average | 253.0 ms | 26.3 ms | Not separately measured |
+| MJPEG p95 frame gap | 382.0 ms | 117.9 ms | Clients stayed synchronized |
+| MJPEG maximum frame gap | 399.7 ms | 207.6 ms | No disconnects |
+| Camera frame age | 0.078 s average | 0.070 s at final health sample | Healthy |
+
+The final health sample reported zero capture failures, no stream error, no analysis error, a saved baseline with no warning, and no Pi thermal throttling. Temperature during checks was approximately 54.5 C to 60.8 C.
 
 ## Simulation Matrix
 
 | Area | Scenario | Method | Result | Fix Applied | Remaining Risk |
 |---|---|---|---|---|---|
-| Repo setup | clone/update latest main | `git clone ... .`, `git pull origin main` | Repository cloned into empty workspace and was up to date on `main` | None | None |
-| Pi setup | fresh setup script flow | static review and `bash -n setup_raspberry_pi.sh` | Script creates venv, config, data dirs, and keeps existing config files | Added `--install-system-packages` for guided apt install of Python venv, Picamera2, and OpenCV packages | Actual apt install not run on Raspberry Pi hardware |
-| Pi run | `run_app.sh` from project root or other cwd | static review and `bash -n` | Script cd's to its own directory, validates Linux venv, creates missing config files | None | Port conflict behavior still depends on Streamlit error output |
-| Camera | Picamera2 missing | `python -c` with default config on Windows | Returned `ok=False` and message telling user to install `python3-picamera2` or use `run_mock.sh` | Reset cached camera handle after capture exceptions | Real camera unavailable and not physically verified |
-| Camera | capture exception / broken handle | code review | A failed capture could keep a partially initialized cached object | Clear Picamera2/OpenCV cached handles after capture/read failure so reruns can retry | Needs real camera stress test |
-| Baseline | missing baseline | unit tests and code review | App initializes a temporary baseline and warns | Existing behavior retained | Temporary baseline is still sensitive to first-frame occupancy |
-| Baseline | corrupted baseline | synthetic invalid image test | Previous warning could be replaced by generic missing-baseline text | Preserve corrupted-baseline warning and explain temporary fallback | Real corrupted SD-card scenarios not physically tested |
-| Baseline | resolution mismatch | synthetic image test | Baseline was resized silently | Added warning explaining old/new resolution and recommending recapture | Diff quality still depends on camera stability |
-| YOLO | ultralytics/model missing | `python -c` `YoloDetector(enabled=True, ...)` | App reported unavailable YOLO and continued diff-only | Existing behavior verified | No real YOLO model inference tested |
-| Demo | PC demo statuses `0`, `1`, `2` | `python -m pytest tests/test_demo.py`, Playwright smoke test | Timeline and injected evidence produce all required statuses without YOLO; browser observed statuses `0`, `1`, and `2` on Monitor | Existing tests retained | Real camera mode statuses still need hardware verification |
-| Demo assets | generator default run | `python tools/generate_demo_assets.py` | Before fix it overwrote assets. After fix it skipped 7 existing assets. | Default now preserves existing seats, timeline, and frames | Users must use `--force` when they intentionally want reset |
-| Demo assets | intentional reset | `python tools/generate_demo_assets.py --force` | Regenerated 7 demo assets | Added CLI flag and README reset instructions | Force still overwrites by design |
-| Scheduling | diff/yolo interval gate | `tests/test_scheduler.py` and app code review | First run executes, then waits until interval; app updates smoothing only when detector/demo changes are due | Existing behavior retained | Multi-session Streamlit timing should be checked on the actual Pi |
-| State smoothing | status `0`, `1`, `2`; object disabled; conservativeness | `tests/test_state_engine.py` | Person, object, empty transition, object-disabled, and conservativeness paths pass | Existing behavior retained | Restart counters remain approximate, as documented |
-| SQLite | writes, duplicate status, WAL/busy timeout | `tests/test_storage.py`, timed Streamlit startup | Current status upserts, logs only status changes, WAL and busy timeout are set. Initial demo startup exposed a `database is locked` error when WAL was applied on every connection. | Configure WAL during initialization with retry, not on every connection; added regression test | Heavy multi-process write contention not fully reproduced |
-| Zone editor | invalid/small/out-of-bounds/overlap logic | `tests/test_validation.py`, static review | Validation warns for small and out-of-bounds polygons; overlap logic present | Improved missing zone-file path messages | Interactive canvas drawing not fully browser-tested on Raspberry Pi |
-| Scripts | Windows launchers | static review, `cmd /c setup_pc.bat`, timed `run_demo.bat`/`run_mock.bat` startup checks | Batch files cd to project root and use non-force demo generation; Streamlit starts on port 8501 | Added wrong-OS `.venv` checks, Python launcher fallback, and free-threaded CPython rejection in setup | `run_demo.bat` and `run_mock.bat` are long-running commands, so verification stopped them after startup |
-| Dependencies | Windows Python 3.13 setup | `cmd /c setup_pc.bat`, pip resolver output | Loose NumPy constraint selected a source build on one interpreter; free-threaded CPython lacked wheels for Pillow/rpds-py | Pinned NumPy below 2.4 with Python-version markers and added free-threaded preflight checks | Future dependency releases may require constraint refresh |
-| Scripts | macOS/Linux launchers | `bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh` | Syntax checks pass | None beyond Pi setup flag | File executable bits verified in git index, not on all filesystems |
+| Repository | latest `main`, dirty files | git status/pull review | Local and Pi source matched; runtime WAL files were untracked | Ignore `data/*.db-*` | Runtime config/data remain intentionally untracked |
+| Pi setup | launcher syntax and paths | `bash -n`, static review | All shell launchers pass syntax and change to project root | Existing preflight retained | Fresh apt install was not repeated on the configured Pi |
+| Camera | real OV5647 capture | Picamera2/service/health/libcamera | 1280x720 frames captured continuously | Background diagnostics and recovery added | A kernel/driver call that never returns can still need service restart |
+| Camera | unexpected capture exception | deterministic unit test | Capture thread recovers and continues | Exception containment, counters, error state, retry backoff | Physical ribbon disconnect during streaming was not performed |
+| Streaming | several open browser tabs | live measurement | 3.03 FPS and 186.2% CPU before fix | Shared JPEG producer and in-memory status/zones | 1280x720 JPEG remains about one CPU core at 10 FPS |
+| Streaming | four concurrent clients | four simultaneous MJPEG readers | All four received 8.78 FPS with 96.7% CPU | One encoded frame is broadcast to all clients | Wi-Fi quality outside this LAN was not tested |
+| Streaming | cached frame sequence | deploy-time live probe | First implementation stopped after two frames | Background capture now advances shared sequence; regression test added | Covered by health sequence/frame-age fields |
+| Baseline | missing/corrupted/mismatched | unit tests and live startup | Temporary fallback worked but warning disappeared after first analysis | Persistent warning and live `Set empty baseline` action | Recapture after camera movement or lighting change |
+| Baseline | real empty scene | visual snapshot review and API action | Saved `data/snapshots/baseline.jpg`, warning cleared | Baseline endpoint serializes with analysis | Operator must ensure seats are empty before reset |
+| Diff/state | actual zones plus synthetic changed frame | Pi-side synthetic image mutation | All 3 zones produced status 2; status 1/0 transitions also passed | Pi tuned to one object hit for 1-second response | A hand is status 2 in diff-only mode, not status 1 |
+| YOLO | missing package and inference exception | monkeypatched tests | App remains available in diff-only mode | Background analysis now includes optional interval-gated YOLO | No real YOLO model was installed or benchmarked |
+| SQLite | integrity, WAL, timeout, repeated status | Pi PRAGMAs and tests | `integrity_check=ok`, WAL, 5000 ms timeout, 3 current rows | Retry regression test and single analysis writer | Multi-process writers outside this service are unsupported |
+| Multi-session | several Streamlit/editor tabs | Chrome and Pi CPU checks | Camera remained single-owner; clients shared stream work | Real mode has one background analysis writer | Running a second app process still conflicts for camera ownership |
+| Zone editor | load, draw, save, delete | deployed browser interaction | Demo target selected, polygon drawn, saved, observed, deleted, and file restored | Live editor, strict JSON validation, atomic writes, write lock | Touch UX on a small phone was not tested |
+| Zone validation | malformed/small/out-of-bounds/overlap | unit/API tests and review | Invalid points rejected; warnings returned for risky geometry | Strict polygon parser and atomic zone writes | Warnings do not block intentional unusual zones |
+| Dashboard | Monitor/Zone Editor/Logs/Settings | deployed Chrome DOM and console checks | All views rendered; no browser console errors | Live status iframe; live mode avoids missing auto-refresh dependency | Logs/settings still need manual refresh in real mode |
+| Demo assets | default and force generation | generator commands and tests | Default preserved all 7 assets; force regenerated intentionally | Existing non-overwrite protection retained | `--force` overwrites by design |
+| Config | malformed numeric/camera dimensions | TOML mutation tests | Previously could leak `TypeError` | All numeric fields produce `ConfigError`; camera dimensions validated | Boolean/path type validation remains conservative |
 
-## Defects Found
+## Defects Found in This Pass
 
-1. Demo asset generator overwrote existing user-edited demo mapping and timeline files by default.
-2. Demo frame generation also overwrote existing files under `demo/frames/` by default.
-3. Corrupted baseline image errors were replaced by a generic "No baseline image found" warning.
-4. Baseline/current frame resolution mismatch was silently resized without telling the operator to recapture a baseline.
-5. Picamera2/OpenCV capture failures could leave cached broken capture objects in memory for later reruns.
-6. Windows batch launchers did not clearly detect a `.venv` directory created by macOS/Linux setup.
-7. Windows setup assumed the `py` launcher and did not fall back to `python`.
-8. Missing zone-file messages were hardcoded around `config/seats.json`, which was misleading in demo mode.
-9. Raspberry Pi setup required the user to discover apt package commands from README/troubleshooting instead of offering an explicit setup option.
-10. `requirements.txt` allowed latest NumPy to resolve to a source build in a Python 3.13 Windows setup.
-11. `setup_pc.bat` selected a free-threaded CPython 3.13 interpreter through `py -3`, which caused native dependency builds and wheel failures.
-12. Streamlit demo startup could hit `sqlite3.OperationalError: database is locked` because WAL mode was applied on regular connections.
+1. Every MJPEG client repeated overlay drawing, zone file reads, SQLite reads, and JPEG encoding.
+2. The real dashboard depended on a missing `streamlit_autorefresh` component even though live video already had its own transport.
+3. Multiple Streamlit sessions ran independent diff/state engines and could write competing status decisions.
+4. The background live analysis path did not run optional YOLO even when configured.
+5. The capture thread could die on an unexpected exception without a health-visible reason.
+6. The first shared-frame implementation did not increment the sequence in the background refresh path and froze after two frames.
+7. A missing baseline warning disappeared after the first temporary-baseline analysis.
+8. There was no live UI action to replace the temporary baseline.
+9. Zone save/delete operations were non-atomic and could lose updates under concurrent requests.
+10. Invalid JSON and partially malformed polygons could close a request or silently discard bad points.
+11. Snapshot requests repeated expensive encoding instead of returning the latest shared frame.
+12. Full-frame RGBA overlay composition consumed about 53.5 ms per frame on the Pi.
+13. Live-mode sidebar controls appeared editable but did not control the background worker.
+14. SQLite WAL sidecar files appeared as untracked git files on the Pi.
+15. Malformed numeric TOML could raise a raw `TypeError` instead of `ConfigError`.
+16. Storage lock retries and YOLO inference failure behavior lacked direct regression tests.
 
 ## Fixes Applied
 
-- Added `--force` to `tools/generate_demo_assets.py`.
-- Changed default demo generation to create only missing assets and preserve existing `demo/demo_seats.json`, `demo/demo_timeline.json`, and demo frames.
-- Added tests for default non-overwrite behavior and force-overwrite behavior.
-- Preserved corrupted-baseline diagnostics when falling back to a temporary baseline.
-- Added baseline resolution mismatch warnings.
-- Added tests for corrupted baseline and resolution mismatch paths.
-- Cleared cached Picamera2/OpenCV handles after capture failures so later reruns can retry cleanly.
-- Added Windows `.venv\Scripts\activate.bat` validation to setup, demo, and mock batch files.
-- Added Python command fallback in `setup_pc.bat`.
-- Added free-threaded CPython detection to PC setup scripts.
-- Added NumPy version markers to keep Windows Python 3.13 setup on a compatible wheel-backed line.
-- Moved SQLite WAL configuration to initialization with retry instead of every connection.
-- Added storage regression coverage that regular connections do not reapply WAL.
-- Added `./setup_raspberry_pi.sh --install-system-packages` for Raspberry Pi OS system package installation.
-- Improved zone-file missing-path error messages and added test coverage.
-- Updated README with demo reset instructions and the Raspberry Pi package-install setup flag.
+- Added one background capture pipeline with frame sequence, age, counters, failure state, and exception recovery.
+- Added one live analysis worker as the real-mode status writer, including optional interval-gated YOLO.
+- Added one overlay/JPEG producer shared by MJPEG clients and snapshots.
+- Replaced full-frame alpha compositing with direct RGBA drawing onto the RGB frame.
+- Added `/health`, `/api/status`, `/snapshot.jpg`, `/status-panel`, and baseline diagnostics to the shared service.
+- Added live baseline capture through `POST /api/baseline` and the zone editor button.
+- Kept temporary-baseline warnings active until a saved baseline is set.
+- Disabled misleading Streamlit runtime controls in real mode and moved real-time status to a polling iframe.
+- Made zone writes atomic and serialized; added strict request/point validation and actionable HTTP 400 errors.
+- Added zone save warnings and delete confirmation.
+- Added numeric configuration coercion/validation and camera source/dimension validation.
+- Added tests for capture recovery, shared JPEG caching, live HTTP endpoints, malformed polygons, baseline persistence, overlay output, SQLite retry, malformed config, missing YOLO, and inference failure.
 
 ## Commands Executed
 
 ```bash
-git clone https://github.com/Min-08/homebase-camera.git .
-git pull origin main
-python --version
-python -m pytest
-python -m compileall app.py homebase_camera tools tests
+git pull --ff-only origin main
+python -m pytest -q
+python -m compileall -q app.py homebase_camera tools tests
 bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh
 python tools/generate_demo_assets.py
 python tools/generate_demo_assets.py --force
-python tools/capture_baseline.py --mock --out data/snapshots/baseline.mock-test.jpg
-python -c "from homebase_camera.config import load_settings; from homebase_camera.capture import CaptureManager; c=load_settings(); r=CaptureManager(c).read_frame(); print(r.ok); print(r.message[:240])"
-python -c "from homebase_camera.yolo_detector import YoloDetector; y=YoloDetector(enabled=True, model_name='definitely_missing_model.pt'); print(y.status.available); print(y.status.message[:240])"
-python -m pytest tests\test_generate_demo_assets.py tests\test_diff_detector.py tests\test_zones.py
-python -m compileall tools\generate_demo_assets.py homebase_camera\diff_detector.py homebase_camera\capture.py homebase_camera\zones.py tests\test_generate_demo_assets.py tests\test_diff_detector.py
-cmd /c setup_pc.bat
-.venv\Scripts\python.exe -m pytest
-cmd /c run_demo.bat
-cmd /c run_mock.bat
-npx --yes --package @playwright/cli playwright-cli open http://localhost:8501
-npx --yes --package @playwright/cli playwright-cli snapshot
-npx --yes --package @playwright/cli playwright-cli click <Zone Editor tab>
-npx --yes --package @playwright/cli playwright-cli click <Logs tab>
-npx --yes --package @playwright/cli playwright-cli click <Settings tab>
+node --check -
+systemctl is-enabled homebase-camera.service
+systemctl is-active homebase-camera.service
+systemctl show homebase-camera.service -p MainPID -p NRestarts -p CPUUsageNSec
+journalctl -u homebase-camera.service --since "30 minutes ago"
+rpicam-hello --list-cameras
+curl http://127.0.0.1:8502/health
+curl http://127.0.0.1:8502/api/status
+curl http://127.0.0.1:8502/snapshot.jpg
 ```
+
+Additional Python probes measured snapshot latency, MJPEG frame timing, four concurrent readers, process CPU, synthetic diff/state transitions, and SQLite PRAGMAs. Browser automation exercised all dashboard tabs and the deployed canvas workflow.
 
 ## Verification Results
 
-| Command | Result |
+| Check | Result |
 |---|---|
-| `python -m pytest` | Passed, 23 tests |
-| `.venv\Scripts\python.exe -m pytest` | Passed, 23 tests |
-| `python -m compileall app.py homebase_camera tools tests` | Passed |
-| `bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh` | Passed |
-| `python tools/generate_demo_assets.py` | Passed after fix, skipped 7 existing assets |
-| `python tools/generate_demo_assets.py --force` | Passed after fix, generated 7 assets |
-| Picamera2 missing simulation | Passed, returned actionable warning and placeholder path |
-| YOLO missing simulation | Passed, stayed unavailable with diff-only warning |
-| Mock baseline capture | Passed, saved mock baseline |
-| Windows `setup_pc.bat` | Passed after dependency/free-threaded preflight fixes |
-| Windows `run_demo.bat` | Passed timed startup check; Streamlit served on `http://localhost:8501`; stopped after verification |
-| Windows `run_mock.bat` | Passed timed startup check; Streamlit served on `http://localhost:8501`; stopped after verification |
-| Streamlit browser smoke test | Passed PC demo Monitor, Zone Editor, Logs, and Settings tab checks with 0 console errors |
-| Raspberry Pi hardware | Not available |
-
-## Recommended Real Raspberry Pi Test Checklist
-
-Run this checklist on a Raspberry Pi 4 Model B with Raspberry Pi OS and one OV5647 camera module:
-
-1. Fresh clone, then `./setup_raspberry_pi.sh --install-system-packages`.
-2. Confirm `.venv` uses system site packages and can import Picamera2.
-3. Run `python tools/capture_baseline.py` with an empty scene.
-4. Run `./run_app.sh` and open `http://localhost:8501`.
-5. Confirm a live camera frame appears and latest snapshot throttling behaves as configured.
-6. Confirm missing/invalid `config/seats.json` messages are understandable.
-7. Draw, save, rename, disable, duplicate, and delete a zone in the Streamlit zone editor.
-8. Check a missing baseline, corrupted baseline, and changed camera resolution produce clear warnings.
-9. Test a person sitting, leaving an object, and leaving the seat empty across several refresh intervals.
-10. Enable YOLO only if installed, then confirm missing model/package does not crash the app.
-11. Open a second browser session and confirm one-operator camera guidance remains acceptable.
-12. Reboot the Pi and confirm SQLite current status restoration and log display.
-13. Run `./run_mock.sh` as a fallback with the camera disconnected.
-14. Run `python -m pytest` and `python -m compileall app.py homebase_camera tools tests` on the Pi if performance allows.
+| Local `python -m pytest -q` | 34 passed |
+| Pi `python -m pytest -q` before final documentation/config hardening | 29 passed |
+| Python compileall | Passed |
+| Shell syntax | Passed |
+| Zone editor/status page JavaScript syntax | Passed |
+| Demo generator default | Passed, 0 generated and 7 preserved |
+| Demo generator `--force` | Passed, intentional regeneration only |
+| Real OV5647 detection | Camera listed and Picamera2 captured continuously |
+| Pi service | enabled, active/running, `NRestarts=0` after intentional restart |
+| SQLite | integrity ok, WAL, busy timeout 5000 ms |
+| Browser | Monitor, Zone Editor, Logs, Settings, canvas save/delete, 0 console errors |
+| Final health | frame/capture/stream/analysis running, no errors or warnings |
 
 ## Remaining Limitations
 
-- Raspberry Pi hardware, OV5647 camera capture, camera ribbon/permission issues, and actual Picamera2 frame acquisition were not physically tested.
-- YOLO model loading and inference were not tested because Ultralytics and a model file were intentionally absent in this workstation simulation.
-- SQLite heavy lock contention was covered by retry/WAL tests and review, but not by a high-load multi-process stress test.
-- Streamlit multi-session camera behavior still needs real Raspberry Pi validation because camera resource behavior can differ from PC mock/demo mode.
-- Pixel-difference quality remains sensitive to lighting changes, camera movement, baseline quality, and camera field of view.
+- A real hand/person placement test was not physically performed by the operator during this automated pass. The exact baseline, camera frame, and zones passed synthetic end-to-end detection on the Pi.
+- Diff-only mode cannot classify a person. A hand or other changed region publishes status 2; status 1 requires YOLO person evidence.
+- Ultralytics/model loading and inference performance were not tested on the Pi.
+- Pixel difference remains sensitive to sunlight, lighting transitions, camera movement, and an incorrect occupied baseline.
+- A camera driver call that hangs inside native code may need `systemctl restart homebase-camera.service`.
+- 1280x720 overlay/JPEG generation at about 10 FPS still consumes approximately one Pi CPU core.
+
+## Recommended Field Checklist
+
+1. Confirm the live health page shows frame age below 0.5 seconds and no errors.
+2. Keep all three zones empty and press `Set empty baseline` after any camera movement.
+3. Put a hand or object in each zone; with the deployed Pi tuning it should reach status 2 on the next 1-second analysis.
+4. Remove it; status should return to 0 on the next analysis.
+5. If YOLO is installed later, verify a seated person reaches status 1 and measure CPU/temperature again.
+6. Test morning/evening lighting and recapture the baseline if false positives appear.
+7. Reboot and verify ports 8501/8502, current status restoration, and service logs.
+8. Disconnect/reconnect the camera only during a controlled maintenance test, then confirm recovery or systemd restart behavior.

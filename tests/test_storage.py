@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from homebase_camera.state_engine import STATUS_EMPTY, STATUS_PERSON, SeatDecision
 from homebase_camera.storage import StatusStore
 
@@ -66,3 +68,23 @@ def test_storage_does_not_reapply_wal_on_regular_connections(tmp_path, monkeypat
     store.get_log()
 
     assert journal_configurations == 0
+
+
+def test_storage_retries_locked_database_errors(tmp_path, monkeypatch):
+    store = StatusStore(tmp_path / "status.db", retries=3)
+    original_connect = store._connect
+    attempts = 0
+
+    def flaky_connect():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return original_connect()
+
+    monkeypatch.setattr(store, "_connect", flaky_connect)
+
+    store.upsert(_decision(STATUS_PERSON))
+
+    assert attempts == 3
+    assert store.get_current()[0]["status"] == STATUS_PERSON
