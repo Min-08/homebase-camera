@@ -37,6 +37,7 @@ class StreamServerInfo:
     zone_editor_url: str
     status_panel_url: str
     presentation_url: str
+    seat_demo_url: str
 
 
 class LiveStreamServer:
@@ -78,6 +79,7 @@ class LiveStreamServer:
             zone_editor_url=f"{base_url}/zone-editor",
             status_panel_url=f"{base_url}/status-panel",
             presentation_url=f"{base_url}/presentation",
+            seat_demo_url=f"{base_url}/seat-demo",
         )
 
 
@@ -119,6 +121,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/presentation":
             self._send_html(_presentation_html())
+            return
+        if parsed.path == "/seat-demo":
+            self._send_html(_seat_demo_html())
             return
         if parsed.path == "/health":
             self._send_json(
@@ -827,6 +832,28 @@ document.getElementById('ready').textContent=pre.ready?'발표 준비 완료':'�
 const summary=document.getElementById('summary');summary.textContent=valid?`사람 있음 ${rows.filter(r=>r.status===1).length} / 전체 ${rows.length}`:`판정 보류: ${friendlyIssue(analysis.invalid_reason)}`;summary.style.borderLeftColor=valid?'#1e8449':'#7f8c8d';
 const seats=document.getElementById('seats');seats.textContent='';rows.forEach(r=>{const row=document.createElement('div');row.className='seat';const name=document.createElement('span');name.textContent=r.seat_name||r.seat_id;const state=document.createElement('span');state.className=!valid?'paused':r.status===1?'occupied':'empty';state.textContent=!valid?'판정 보류':r.status===1?'사람 있음':'사람 없음';row.append(name,state);seats.append(row)});
 const checks=document.getElementById('checks');checks.textContent='';(pre.checks||[]).filter(c=>!c.ok).forEach(c=>{const row=document.createElement('div');row.className='check bad';row.textContent=`${c.label}: ${friendlyIssue(c.detail)}`;checks.append(row)});}catch(e){document.getElementById('ready').textContent='연결 끊김';document.getElementById('ready').className='bad'}finally{refreshRunning=false}}
+setInterval(refresh,1000);refresh();</script></body></html>"""
+
+
+def _seat_demo_html() -> str:
+    return r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Homebase Seat Demo</title><style>
+:root{font-family:Arial,"Malgun Gothic",sans-serif;color:#17202a;background:#f4f6f7}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column}header{height:64px;padding:0 28px;background:#17202a;color:#fff;display:flex;align-items:center;justify-content:space-between}
+header strong{font-size:21px}#connection{font-size:13px;color:#d5d8dc}main{width:min(1180px,100%);margin:auto;padding:32px 24px 44px}
+.seats{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:18px}.seat{aspect-ratio:1.18/1;border:2px solid #aab7b8;background:#e5e7e9;color:#566573;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:background-color .35s,border-color .35s,color .35s,transform .2s;min-width:0}
+.seat.available{background:#d5f5e3;border-color:#239b56;color:#145a32}.seat.occupied{background:#dc2626;border-color:#991b1b;color:#fff;transform:translateY(-3px)}.seat.waiting{background:#e5e7e9;border-color:#7f8c8d;color:#566573}.seat.unconfigured{background:#f8f9f9;border:2px dashed #bdc3c7;color:#99a3a4}
+.name{font-size:clamp(17px,2vw,25px);font-weight:700;max-width:92%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.state{font-size:14px;margin-top:12px;font-weight:700}.occupied .state{font-size:16px}
+@media(max-width:820px){main{padding:22px 16px}.seats{grid-template-columns:repeat(2,minmax(130px,1fr));gap:12px}.seat:last-child{grid-column:1/-1;width:calc(50% - 6px);justify-self:center}}
+@media(max-width:420px){.seats{grid-template-columns:1fr}.seat:last-child{grid-column:auto;width:100%}}
+</style></head><body><header><strong>Homebase Seat Demo</strong><span id="connection">연결 중</span></header>
+<main><section id="seats" class="seats" aria-label="좌석 상태"></section></main><script>
+const container=document.getElementById('seats');
+for(let i=0;i<5;i++){const seat=document.createElement('div');seat.className='seat unconfigured';seat.innerHTML=`<div class="name">Seat ${i+1}</div><div class="state">조닝 필요</div>`;container.appendChild(seat)}
+let refreshRunning=false;
+async function fetchTimed(url){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),4000);try{return await fetch(url,{cache:'no-store',signal:controller.signal})}finally{clearTimeout(timer)}}
+async function refresh(){if(refreshRunning)return;refreshRunning=true;try{const [statusRes,zonesRes]=await Promise.all([fetchTimed('/api/status'),fetchTimed('/api/zones')]);if(!statusRes.ok||!zonesRes.ok)throw Error('서버 응답 오류');const status=await statusRes.json(),zones=await zonesRes.json(),valid=status.analysis?.valid===true;const configured=(zones.zones||[]).filter(zone=>zone.enabled!==false).slice(0,5);const rows=new Map((status.current||[]).map(row=>[row.seat_id,row]));[...container.children].forEach((seat,index)=>{const zone=configured[index],name=seat.querySelector('.name'),state=seat.querySelector('.state');if(!zone){seat.className='seat unconfigured';name.textContent=`Seat ${index+1}`;state.textContent='조닝 필요';return}const row=rows.get(zone.seat_id);name.textContent=zone.seat_name||zone.seat_id;if(!valid||!row){seat.className='seat waiting';state.textContent='판정 대기'}else if(row.status===1){seat.className='seat occupied';state.textContent='사람 있음'}else{seat.className='seat available';state.textContent='사람 없음'}});document.getElementById('connection').textContent='실시간 연결'}catch(error){document.getElementById('connection').textContent='재연결 중'}finally{refreshRunning=false}}
 setInterval(refresh,1000);refresh();</script></body></html>"""
 
 

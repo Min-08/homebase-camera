@@ -39,6 +39,7 @@ def test_desktop_launcher_installer_creates_all_module_shortcuts(tmp_path: Path)
         "Homebase Camera.desktop": "start",
         "Homebase Zone Editor.desktop": "zones",
         "Homebase Presentation.desktop": "presentation",
+        "Homebase Seat Demo.desktop": "seats",
         "Homebase Preflight.desktop": "doctor --pause",
         "Homebase Health.desktop": "health --pause",
         "Homebase Empty Baseline.desktop": "baseline --pause",

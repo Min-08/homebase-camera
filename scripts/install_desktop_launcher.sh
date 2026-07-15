@@ -48,6 +48,7 @@ EOF
 
 install_launcher "Homebase Camera.desktop" "Homebase Camera" "Homebase 전체 실행" "카메라와 대시보드를 시작합니다" "start" "camera-video"
 install_launcher "Homebase Presentation.desktop" "Homebase Presentation" "Homebase 발표 화면" "읽기 전용 실시간 좌석 현황을 엽니다" "presentation" "video-display"
+install_launcher "Homebase Seat Demo.desktop" "Homebase Seat Demo" "Homebase 좌석 데모" "5개 좌석의 실시간 점유 변화만 표시합니다" "seats" "view-grid"
 install_launcher "Homebase Preflight.desktop" "Homebase Presentation Check" "Homebase 발표 사전 점검" "카메라, 스트림, 판정 모델과 데이터베이스를 점검합니다" "doctor" "dialog-information" "1"
 install_launcher "Homebase Zone Editor.desktop" "Homebase Zone Editor" "Homebase 좌석 구역 편집" "실시간 영상에서 좌석 구역을 편집합니다" "zones" "applications-graphics"
 install_launcher "Homebase Health.desktop" "Homebase Health Check" "Homebase 상태 점검" "서비스와 카메라 상태를 출력합니다" "health" "utilities-system-monitor" "1"

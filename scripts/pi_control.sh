@@ -280,6 +280,12 @@ presentation_action() {
   open_url "$LIVE_URL/presentation" || true
 }
 
+seat_demo_action() {
+  ensure_live_service
+  info "5석 좌석 데모를 엽니다: $LIVE_URL/seat-demo"
+  open_url "$LIVE_URL/seat-demo" || true
+}
+
 doctor_action() {
   ensure_live_service
   echo
@@ -437,6 +443,7 @@ Homebase Camera 실행 도구
 명령:
   start          전체 서비스와 대시보드 실행
   presentation   발표 전용 화면 열기
+  seats          5석 좌석 데모 열기
   doctor         발표 사전 점검 실행
   zones          실시간 좌석 구역 편집기 열기
   baseline       현재 빈 좌석 화면을 기준 이미지로 저장
@@ -486,6 +493,7 @@ case "$ACTION" in
   start) start_action ;;
   zones|zone) zones_action ;;
   presentation|present) presentation_action ;;
+  seats|seat-demo|seatdemo) seat_demo_action ;;
   doctor|preflight) doctor_action ;;
   health|status|check) health_action ;;
   baseline) baseline_action ;;

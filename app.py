@@ -303,6 +303,7 @@ def _live_stream_panel(stream_info: StreamServerInfo) -> None:
     )
     st.caption(f"Live stream: {stream_info.stream_url}")
     st.link_button("Open presentation view", stream_info.presentation_url)
+    st.link_button("Open five-seat demo", stream_info.seat_demo_url)
     st.link_button("Open live zone editor", stream_info.zone_editor_url)
 
 
