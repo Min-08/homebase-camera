@@ -820,11 +820,13 @@ header strong{font-size:20px}#ready{font-size:13px}.layout{display:grid;grid-tem
 <h1>실시간 좌석 현황</h1><div id="summary" class="summary">판정 준비 중</div><div id="seats"></div><div id="checks"></div>
 </aside></main><script>
 function friendlyIssue(message){const text=message||'장면을 확인하세요';if(text.includes('All seat zones changed heavily'))return '카메라 위치 또는 기준 이미지가 현재 장면과 다릅니다. 빈 좌석 기준 이미지를 다시 저장하세요.';if(text.includes('baseline'))return '빈 좌석 기준 이미지를 다시 저장하세요.';if(text.includes('zone'))return '좌석 구역 설정을 확인하세요.';return text}
-async function refresh(){try{const [s,p]=await Promise.all([fetch('/api/status'),fetch('/api/preflight')]);if(!s.ok||!p.ok)throw Error('서버 응답 오류');const data=await s.json(),pre=await p.json(),analysis=data.analysis||{},valid=analysis.valid===true,rows=data.current||[];
+let refreshRunning=false;
+async function fetchTimed(url){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),4000);try{return await fetch(url,{cache:'no-store',signal:controller.signal})}finally{clearTimeout(timer)}}
+async function refresh(){if(refreshRunning)return;refreshRunning=true;try{const [s,p]=await Promise.all([fetchTimed('/api/status'),fetchTimed('/api/preflight')]);if(!s.ok||!p.ok)throw Error('서버 응답 오류');const data=await s.json(),pre=await p.json(),analysis=data.analysis||{},valid=analysis.valid===true,rows=data.current||[];
 document.getElementById('ready').textContent=pre.ready?'발표 준비 완료':'점검 필요';document.getElementById('ready').className=pre.ready?'':'bad';
 const summary=document.getElementById('summary');summary.textContent=valid?`사람 있음 ${rows.filter(r=>r.status===1).length} / 전체 ${rows.length}`:`판정 보류: ${friendlyIssue(analysis.invalid_reason)}`;summary.style.borderLeftColor=valid?'#1e8449':'#7f8c8d';
 const seats=document.getElementById('seats');seats.textContent='';rows.forEach(r=>{const row=document.createElement('div');row.className='seat';const name=document.createElement('span');name.textContent=r.seat_name||r.seat_id;const state=document.createElement('span');state.className=!valid?'paused':r.status===1?'occupied':'empty';state.textContent=!valid?'판정 보류':r.status===1?'사람 있음':'사람 없음';row.append(name,state);seats.append(row)});
-const checks=document.getElementById('checks');checks.textContent='';(pre.checks||[]).filter(c=>!c.ok).forEach(c=>{const row=document.createElement('div');row.className='check bad';row.textContent=`${c.label}: ${friendlyIssue(c.detail)}`;checks.append(row)});}catch(e){document.getElementById('ready').textContent='연결 끊김';document.getElementById('ready').className='bad'}}
+const checks=document.getElementById('checks');checks.textContent='';(pre.checks||[]).filter(c=>!c.ok).forEach(c=>{const row=document.createElement('div');row.className='check bad';row.textContent=`${c.label}: ${friendlyIssue(c.detail)}`;checks.append(row)});}catch(e){document.getElementById('ready').textContent='연결 끊김';document.getElementById('ready').className='bad'}finally{refreshRunning=false}}
 setInterval(refresh,1000);refresh();</script></body></html>"""
 
 
@@ -856,10 +858,23 @@ header { display: flex; justify-content: space-between; align-items: center; pad
 <script>
 const colors = {0:'#16a34a', 1:'#dc2626'};
 const labels = {0:'사람 없음', 1:'사람 있음'};
+let refreshRunning = false;
+
+async function fetchTimed(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    return await fetch(url, {cache: 'no-store', signal: controller.signal});
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function refresh() {
+  if (refreshRunning) return;
+  refreshRunning = true;
   try {
-    const [statusRes, healthRes] = await Promise.all([fetch('/api/status'), fetch('/health')]);
+    const [statusRes, healthRes] = await Promise.all([fetchTimed('/api/status'), fetchTimed('/health')]);
     if (!statusRes.ok || !healthRes.ok) throw new Error(`HTTP ${statusRes.status}/${healthRes.status}`);
     const data = await statusRes.json();
     const health = await healthRes.json();
@@ -905,6 +920,8 @@ async function refresh() {
     const warning = document.getElementById('warning');
     warning.textContent = `Live status unavailable: ${err}`;
     warning.style.display = 'block';
+  } finally {
+    refreshRunning = false;
   }
 }
 setInterval(refresh, 1000);
@@ -1057,9 +1074,15 @@ async function loadZones() {
   }
 }
 
+let statusLoading = false;
+
 async function loadStatus() {
+  if (statusLoading) return;
+  statusLoading = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch('/api/status', {cache: 'no-store', signal: controller.signal});
     const data = await res.json();
     const el = document.getElementById('currentStatus');
     const rows = data.current || [];
@@ -1082,6 +1105,9 @@ async function loadStatus() {
     });
   } catch (err) {
     document.getElementById('currentStatus').textContent = `status unavailable: ${err}`;
+  } finally {
+    clearTimeout(timer);
+    statusLoading = false;
   }
 }
 
