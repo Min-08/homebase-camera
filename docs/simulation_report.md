@@ -1,153 +1,136 @@
-# Raspberry Pi Simulation and Reliability Report
+# Homebase Camera 검증 보고서
 
-Date: 2026-07-15
+검증일: 2026-07-15
+대상: Windows 개발 PC, Raspberry Pi 4B (`aarch64`, OV5647, `172.30.1.100`)
 
-Repository: `https://github.com/Min-08/homebase-camera/tree/main`
+## 결론
 
-## Environments
+소프트웨어 판정 계약은 `0=사람 없음`, `1=사람 있음`으로 통일됐다. 사람 검출이 없는
+픽셀 변화, 가방 증거, 유효하지 않은 기준 이미지로는 `1`이 생성되지 않는다. YOLO는 분석
+스레드와 분리되어 실제 파이 추론 중에도 카메라와 MJPEG 스트림이 계속 갱신됐다.
 
-- Windows workstation: Python 3.13.8, PowerShell, browser automation
-- Raspberry Pi 4 Model B: 8 GB RAM, Raspbian GNU/Linux 13 (trixie), Python 3.13.5
-- Camera: OV5647 detected by libcamera at `/base/soc/i2c0mux/i2c@1/ov5647@36`
-- Camera stream under test: 1280x720 RGB888, 10 FPS target, JPEG quality 75
-- Raspberry Pi service: `homebase-camera.service`, Streamlit on ports 8501 and 8502
-- YOLO: disabled on the Pi; Ultralytics missing/failure paths were simulated
+현재 발표 준비를 막는 유일한 현장 조건은 카메라가 실제 좌석이 아닌 천장을 향하고 있고,
+저장된 기준 이미지와 현재 장면이 다르다는 점이다. 시스템은 이 상태를 정상 판정으로
+오인하지 않고 `판정 보류`, 회색 구역, 사전점검 실패로 표시한다.
 
-This pass combined code review, unit/integration tests, synthetic images, SQLite retry tests, shell checks, actual Raspberry Pi execution, live camera measurements, four-client streaming load, and browser interaction with the deployed dashboard and zone editor.
+## 자동 시험
 
-## Outcome
+| 시험 | 방법 | 결과 |
+|---|---|---|
+| 로컬 단위·통합 시험 | `python -m pytest -q` | 52 passed, 2 skipped |
+| 파이 단위·통합 시험 | 파이 `.venv/bin/python -m pytest -q` | 54 passed |
+| 컴파일 | `python -m compileall -q app.py homebase_camera tools tests` | 통과 |
+| 패치 형식 | `git diff --check` | 통과 |
+| 셸 문법 | `bash -n`으로 Pi 실행 스크립트 검사 | 통과 |
+| DB 마이그레이션 | 과거 상태 `2`가 든 임시 SQLite 로드 | 전부 `1`로 정규화, 신규 값은 0/1만 저장 |
+| 모델 설치기 | 로컬 URL 다운로드, 정상/잘못된 SHA-256 | 정상 설치, 불일치 파일 교체 차단 |
+| 비동기 경계 | 80 ms 지연 가짜 검출기 | 호출 스레드 비차단, 동시 중복 추론 차단 |
+| 주기 보정 | 변화 없는 연속 분석 2회 | 최초 즉시 검사 후 평상시 주기 검사 요청 확인 |
+| 무효 장면 보존 | 빈 파일·카메라 이동·전체 장면 불일치 | 상태 변경 없이 판정 보류 |
+| 물체 전용 | 신뢰도 0.99 가방 증거 | 상태 0 |
 
-The camera, analysis worker, database, dashboard, live status panel, and zone editor are operational on the real Raspberry Pi. The main live-video defect was per-client work: every MJPEG connection independently loaded zones, read SQLite, drew overlays, and encoded JPEG. With several old dashboard/editor tabs open, the Pi used about 186 percent of one CPU core and delivered about 3 FPS despite a 10 FPS setting.
+## 실제 이미지 테스트베드
 
-The live path now captures once, analyzes once, renders/encodes once, and distributes the cached JPEG to every client. Real mode no longer reruns Streamlit for each camera/status refresh. A later frame-sequence defect found during deployment testing was fixed before final verification.
+고정 SHA-256의 `yolov8n.onnx`를 OpenCV DNN으로 실행했다. 사람 입력은 Ultralytics
+공개 자산의 `bus.jpg`, `zidane.jpg`를 사용했다. 음성 입력은 사람을 제외한 버스 부분
+크롭과 생성된 빈 교실 이미지를 사용했다. 각 이미지를 전체 좌석 구역 하나로 감싸 모델
+검출, 구역 배정, 상태 엔진까지 한 번에 통과시켰다.
 
-An empty 1280x720 baseline was captured from the deployed zone editor. Pi-specific detection settings were tuned to a 1-second diff interval, one required object hit, one required empty hit, and a 0.015 changed-pixel threshold.
-
-## Live Performance
-
-| Measurement | Before | Final single probe | Four concurrent clients |
+| 입력 | 사람 신뢰도 | Windows 상태 / 시간 | Pi 상태 / 시간 |
 |---|---:|---:|---:|
-| Delivered MJPEG FPS | 3.03 | 9.61 | 8.78 each |
-| Process CPU, one core = 100% | 186.2% | 101.5% | 96.7% |
-| Snapshot latency average | 253.0 ms | 26.3 ms | Not separately measured |
-| MJPEG p95 frame gap | 382.0 ms | 117.9 ms | Clients stayed synchronized |
-| MJPEG maximum frame gap | 399.7 ms | 207.6 ms | No disconnects |
-| Camera frame age | 0.078 s average | 0.070 s at final health sample | Healthy |
+| bus.jpg | 0.880 | 1 / 0.320 s | 1 / 4.612 s |
+| zidane.jpg | 0.821 | 1 / 0.229 s | 1 / 4.562 s |
+| 사람 없는 버스 크롭 | 0.000 | 0 / 0.240 s | 0 / 4.554 s |
+| 빈 교실 | 0.000 | 0 / 0.232 s | 0 / 4.524 s |
+| 가방 전용 합성 증거 | 해당 없음 | 0 | 0 |
 
-The final health sample reported zero capture failures, no stream error, no analysis error, a saved baseline with no warning, and no Pi thermal throttling. Temperature during checks was approximately 54.5 C to 60.8 C.
+결과는 사람 양성 2/2, 사람 음성 3/3이다. 표본이 작으므로 실제 정확도 백분율로
+일반화하지 않는다. 이 시험의 목적은 실행 모델과 상태 계약이 연결됐는지 확인하는 것이다.
 
-## Simulation Matrix
+## 파이 성능
 
-| Area | Scenario | Method | Result | Fix Applied | Remaining Risk |
-|---|---|---|---|---|---|
-| Repository | latest `main`, dirty files | git status/pull review | Local and Pi source matched; runtime WAL files were untracked | Ignore `data/*.db-*` | Runtime config/data remain intentionally untracked |
-| Pi setup | launcher syntax and paths | `bash -n`, static review | All shell launchers pass syntax and change to project root | Existing preflight retained | Fresh apt install was not repeated on the configured Pi |
-| Camera | real OV5647 capture | Picamera2/service/health/libcamera | 1280x720 frames captured continuously | Background diagnostics and recovery added | A kernel/driver call that never returns can still need service restart |
-| Camera | unexpected capture exception | deterministic unit test | Capture thread recovers and continues | Exception containment, counters, error state, retry backoff | Physical ribbon disconnect during streaming was not performed |
-| Streaming | several open browser tabs | live measurement | 3.03 FPS and 186.2% CPU before fix | Shared JPEG producer and in-memory status/zones | 1280x720 JPEG remains about one CPU core at 10 FPS |
-| Streaming | four concurrent clients | four simultaneous MJPEG readers | All four received 8.78 FPS with 96.7% CPU | One encoded frame is broadcast to all clients | Wi-Fi quality outside this LAN was not tested |
-| Streaming | cached frame sequence | deploy-time live probe | First implementation stopped after two frames | Background capture now advances shared sequence; regression test added | Covered by health sequence/frame-age fields |
-| Baseline | missing/corrupted/mismatched | unit tests and live startup | Temporary fallback worked but warning disappeared after first analysis | Persistent warning and live `Set empty baseline` action | Recapture after camera movement or lighting change |
-| Baseline | real empty scene | visual snapshot review and API action | Saved `data/snapshots/baseline.jpg`, warning cleared | Baseline endpoint serializes with analysis | Operator must ensure seats are empty before reset |
-| Diff/state | actual zones plus synthetic changed frame | Pi-side synthetic image mutation | All 3 zones produced status 2; status 1/0 transitions also passed | Pi tuned to one object hit for 1-second response | A hand is status 2 in diff-only mode, not status 1 |
-| YOLO | missing package and inference exception | monkeypatched tests | App remains available in diff-only mode | Background analysis now includes optional interval-gated YOLO | No real YOLO model was installed or benchmarked |
-| SQLite | integrity, WAL, timeout, repeated status | Pi PRAGMAs and tests | `integrity_check=ok`, WAL, 5000 ms timeout, 3 current rows | Retry regression test and single analysis writer | Multi-process writers outside this service are unsupported |
-| Multi-session | several Streamlit/editor tabs | Chrome and Pi CPU checks | Camera remained single-owner; clients shared stream work | Real mode has one background analysis writer | Running a second app process still conflicts for camera ownership |
-| Zone editor | load, draw, save, delete | deployed browser interaction | Demo target selected, polygon drawn, saved, observed, deleted, and file restored | Live editor, strict JSON validation, atomic writes, write lock | Touch UX on a small phone was not tested |
-| Zone validation | malformed/small/out-of-bounds/overlap | unit/API tests and review | Invalid points rejected; warnings returned for risky geometry | Strict polygon parser and atomic zone writes | Warnings do not block intentional unusual zones |
-| Dashboard | Monitor/Zone Editor/Logs/Settings | deployed Chrome DOM and console checks | All views rendered; no browser console errors | Live status iframe; live mode avoids missing auto-refresh dependency | Logs/settings still need manual refresh in real mode |
-| Demo assets | default and force generation | generator commands and tests | Default preserved all 7 assets; force regenerated intentionally | Existing non-overwrite protection retained | `--force` overwrites by design |
-| Config | malformed numeric/camera dimensions | TOML mutation tests | Previously could leak `TypeError` | All numeric fields produce `ConfigError`; camera dimensions validated | Boolean/path type validation remains conservative |
+### 평상시, 현재 장면 불일치 상태
 
-## Defects Found in This Pass
+15초 동안 프레임 시퀀스와 스냅샷 20회를 측정했다.
 
-1. Every MJPEG client repeated overlay drawing, zone file reads, SQLite reads, and JPEG encoding.
-2. The real dashboard depended on a missing `streamlit_autorefresh` component even though live video already had its own transport.
-3. Multiple Streamlit sessions ran independent diff/state engines and could write competing status decisions.
-4. The background live analysis path did not run optional YOLO even when configured.
-5. The capture thread could die on an unexpected exception without a health-visible reason.
-6. The first shared-frame implementation did not increment the sequence in the background refresh path and froze after two frames.
-7. A missing baseline warning disappeared after the first temporary-baseline analysis.
-8. There was no live UI action to replace the temporary baseline.
-9. Zone save/delete operations were non-atomic and could lose updates under concurrent requests.
-10. Invalid JSON and partially malformed polygons could close a request or silently discard bad points.
-11. Snapshot requests repeated expensive encoding instead of returning the latest shared frame.
-12. Full-frame RGBA overlay composition consumed about 53.5 ms per frame on the Pi.
-13. Live-mode sidebar controls appeared editable but did not control the background worker.
-14. SQLite WAL sidecar files appeared as untracked git files on the Pi.
-15. Malformed numeric TOML could raise a raw `TypeError` instead of `ConfigError`.
-16. Storage lock retries and YOLO inference failure behavior lacked direct regression tests.
+| 항목 | 결과 |
+|---|---:|
+| 카메라 캡처 | 10.00 FPS |
+| 공유 MJPEG 생성 | 8.93 FPS |
+| 스냅샷 평균 / 최대 | 3.4 ms / 6.0 ms |
+| 최근 프레임 지연 | 0.065 s |
+| 분석 1회 | 198.8 ms |
+| 프로세스 CPU / RSS | 84.2% / 191,744 KiB |
+| 온도 | 57.5 C |
 
-## Fixes Applied
+### 실제 서비스 비동기 YOLO 통합 시험
 
-- Added one background capture pipeline with frame sequence, age, counters, failure state, and exception recovery.
-- Added one live analysis worker as the real-mode status writer, including optional interval-gated YOLO.
-- Added one overlay/JPEG producer shared by MJPEG clients and snapshots.
-- Replaced full-frame alpha compositing with direct RGBA drawing onto the RGB frame.
-- Added `/health`, `/api/status`, `/snapshot.jpg`, `/status-panel`, and baseline diagnostics to the shared service.
-- Added live baseline capture through `POST /api/baseline` and the zone editor button.
-- Kept temporary-baseline warnings active until a saved baseline is set.
-- Disabled misleading Streamlit runtime controls in real mode and moved real-time status to a polling iframe.
-- Made zone writes atomic and serialized; added strict request/point validation and actionable HTTP 400 errors.
-- Added zone save warnings and delete confirmation.
-- Added numeric configuration coercion/validation and camera source/dimension validation.
-- Added tests for capture recovery, shared JPEG caching, live HTTP endpoints, malformed polygons, baseline persistence, overlay output, SQLite retry, malformed config, missing YOLO, and inference failure.
+현재 천장 장면을 임시 기준으로 저장한 뒤 22초간 서비스 내부 YOLO를 실행하고, 시험 후
+원래 기준 이미지를 복원했다.
 
-## Commands Executed
+| 항목 | 결과 |
+|---|---:|
+| YOLO 완료 횟수 | 3회 |
+| YOLO 최대 추론 시간 | 4.773 s |
+| 카메라 스트림 | 9.42 FPS |
+| 최근 프레임 지연 | 0.098 s |
+| 분석 루프 최대 처리 시간 | 399.1 ms |
+| 최고 측정 온도 | 61.3 C |
+| 좌석 상태 | 0, 0, 0 |
 
-```bash
-git pull --ff-only origin main
-python -m pytest -q
-python -m compileall -q app.py homebase_camera tools tests
-bash -n setup_raspberry_pi.sh run_app.sh run_mock.sh setup_pc.sh run_demo.sh
-python tools/generate_demo_assets.py
-python tools/generate_demo_assets.py --force
-node --check -
-systemctl is-enabled homebase-camera.service
-systemctl is-active homebase-camera.service
-systemctl show homebase-camera.service -p MainPID -p NRestarts -p CPUUsageNSec
-journalctl -u homebase-camera.service --since "30 minutes ago"
-rpicam-hello --list-cameras
-curl http://127.0.0.1:8502/health
-curl http://127.0.0.1:8502/api/status
-curl http://127.0.0.1:8502/snapshot.jpg
-```
+별도 프로세스에서 YOLO 두 번을 연속 실행한 더 강한 CPU 경합 시험에서도 캡처 10.0 FPS,
+스트림 9.83 FPS, 프레임 지연 0.07초, 온도 64.3 C였다.
 
-Additional Python probes measured snapshot latency, MJPEG frame timing, four concurrent readers, process CPU, synthetic diff/state transitions, and SQLite PRAGMAs. Browser automation exercised all dashboard tabs and the deployed canvas workflow.
+기준 이미지를 새로 저장한 직후에는 장면·모델 항목이 정상이더라도 `최근 사람 검사`가
+실패해 사전점검이 통과하지 않았다. 실제 첫 추론이 끝난 5.2초 뒤 모든 항목이 자동으로
+통과했다. 따라서 모델 파일만 로드되고 추론이 멈춘 상태도 준비 완료로 오인하지 않는다.
 
-## Verification Results
+## 브라우저 검증
 
-| Check | Result |
+Playwright로 실제 파이의 Streamlit 화면과 `:8502/presentation`을 열어 확인했다.
+
+- 라이브 영상 표시
+- 발표 화면 링크와 좌석 편집 링크 표시
+- 분석 설정 1초/8초/0.25 표시
+- 3개 좌석 모두 `판정 보류` 표시
+- 영상 오버레이를 회색 `?`로 표시
+- 알려진 장면 불일치를 한국어 조치 문구로 표시
+- 발표 화면에 상태 변경 POST 요청이나 기준 이미지 버튼이 없음
+- 파비콘 404 수정 후 콘솔 오류 0건
+- 데스크톱과 반응형 1열 CSS 경로 확인
+
+## 사전점검 결과
+
+현재 `/api/preflight` 결과:
+
+| 항목 | 결과 |
 |---|---|
-| Local `python -m pytest -q` | 34 passed |
-| Pi `python -m pytest -q` | 34 passed |
-| Python compileall | Passed |
-| Shell syntax | Passed |
-| Zone editor/status page JavaScript syntax | Passed |
-| Demo generator default | Passed, 0 generated and 7 preserved |
-| Demo generator `--force` | Passed, intentional regeneration only |
-| Real OV5647 detection | Camera listed and Picamera2 captured continuously |
-| Pi service | enabled, active/running, `NRestarts=0` after intentional restart |
-| SQLite | integrity ok, WAL, busy timeout 5000 ms |
-| Browser | Monitor, Zone Editor, Logs, Settings, canvas save/delete, 0 console errors |
-| Final health | frame/capture/stream/analysis running, no errors or warnings |
+| 카메라 | 통과 |
+| 실시간 프레임 | 통과 |
+| MJPEG 스트리밍 | 통과 |
+| 좌석 구역 3개 | 통과 |
+| 기준 이미지 파일 | 통과 |
+| 분석 루프 | 통과 |
+| 사람 인식 ONNX 모델 | 통과 |
+| 최근 사람 검사 | 현재 장면 불일치로 실행 보류 |
+| SQLite quick_check | 통과 |
+| 온도 | 통과 |
+| 현재 장면과 기준 이미지 정합성 | **실패, 현장 재설정 필요** |
 
-## Remaining Limitations
+`./homebase doctor`는 이 조건에서 종료 코드 1을 반환하므로 잘못된 상태로 발표를 시작하는
+것을 막는다.
 
-- A real hand/person placement test was not physically performed by the operator during this automated pass. The exact baseline, camera frame, and zones passed synthetic end-to-end detection on the Pi.
-- Diff-only mode cannot classify a person. A hand or other changed region publishes status 2; status 1 requires YOLO person evidence.
-- Ultralytics/model loading and inference performance were not tested on the Pi.
-- Pixel difference remains sensitive to sunlight, lighting transitions, camera movement, and an incorrect occupied baseline.
-- A camera driver call that hangs inside native code may need `systemctl restart homebase-camera.service`.
-- 1280x720 overlay/JPEG generation at about 10 FPS still consumes approximately one Pi CPU core.
+## 최종 현장 검증 절차
 
-## Recommended Field Checklist
+다음 항목은 카메라를 실제 좌석으로 돌린 뒤 사람이 직접 수행해야 한다.
 
-1. Confirm the live health page shows frame age below 0.5 seconds and no errors.
-2. Keep all three zones empty and press `Set empty baseline` after any camera movement.
-3. Put a hand or object in each zone; with the deployed Pi tuning it should reach status 2 on the next 1-second analysis.
-4. Remove it; status should return to 0 on the next analysis.
-5. If YOLO is installed later, verify a seated person reaches status 1 and measure CPU/temperature again.
-6. Test morning/evening lighting and recapture the baseline if false positives appear.
-7. Reboot and verify ports 8501/8502, current status restoration, and service logs.
-8. Disconnect/reconnect the camera only during a controlled maintenance test, then confirm recovery or systemd restart behavior.
+1. 카메라를 고정하고 좌석 3개 구역을 실제 의자 면에 다시 그린다.
+2. 모든 좌석이 빈 상태에서 기준 이미지를 다시 저장한다.
+3. `./homebase doctor`가 전 항목 통과하는지 확인한다.
+4. 각 좌석에 한 명씩 앉아 1, 퇴장 후 0이 되는지 확인한다.
+5. 두 명 동시 입장, 빠른 입장·퇴장, 일부 가림을 확인한다.
+6. 가방·책·손만 구역에 넣었을 때 0을 유지하는지 확인한다.
+7. 발표 PC에서 5분간 스트림 끊김과 온도를 확인한다.
+
+이 현장 절차 전에는 소프트웨어 경로는 검증됐지만 실제 설치 정확도가 승인됐다고 표현하면
+안 된다.

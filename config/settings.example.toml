@@ -11,14 +11,13 @@ frame_width = 1280
 frame_height = 720
 
 [detection]
-diff_interval_seconds = 3
+diff_interval_seconds = 1
 yolo_enabled = true
-yolo_interval_seconds = 20
-yolo_model = "yolov8n.pt"
-object_occupancy_enabled = true
-object_conservativeness = 5
+yolo_interval_seconds = 8
+yolo_model = "data/models/yolov8n.onnx"
 empty_required_hits = 2
 person_required_hits = 1
+person_confidence_threshold = 0.25
 diff_threshold = 30
 change_ratio_threshold = 0.04
 baseline_path = "data/snapshots/baseline.jpg"

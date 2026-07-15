@@ -5,20 +5,18 @@ from typing import Mapping
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .state_engine import STATUS_EMPTY, STATUS_OBJECT, STATUS_PERSON
+from .state_engine import STATUS_EMPTY, STATUS_OCCUPIED
 from .zones import Zone
 
 
 STATUS_COLORS = {
     STATUS_EMPTY: "#16a34a",
-    STATUS_PERSON: "#2563eb",
-    STATUS_OBJECT: "#d97706",
+    STATUS_OCCUPIED: "#dc2626",
 }
 
 STATUS_SHORT_LABELS = {
     STATUS_EMPTY: "Empty",
-    STATUS_PERSON: "Occupied",
-    STATUS_OBJECT: "Temporarily Left",
+    STATUS_OCCUPIED: "Occupied",
 }
 
 
@@ -43,7 +41,8 @@ def draw_zones(
         if points:
             label_x = min(x for x, _ in points)
             label_y = min(y for _, y in points)
-            label = f"{zone.seat_name} ({status})"
+            status_label = "?" if status not in STATUS_COLORS else str(status)
+            label = f"{zone.seat_name} ({status_label})"
             box = draw.textbbox((label_x, max(0, label_y - 22)), label)
             draw.rectangle((box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2), fill=(15, 23, 42, 190))
             draw.text((label_x, max(0, label_y - 22)), label, fill=(255, 255, 255, 255))

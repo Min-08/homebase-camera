@@ -274,6 +274,33 @@ zones_action() {
   open_url "$LIVE_URL/zone-editor" || true
 }
 
+presentation_action() {
+  ensure_live_service
+  info "발표 전용 화면을 엽니다: $LIVE_URL/presentation"
+  open_url "$LIVE_URL/presentation" || true
+}
+
+doctor_action() {
+  ensure_live_service
+  echo
+  echo "=== Homebase 발표 사전 점검 ==="
+  curl --fail --silent --show-error --max-time 10 "$LIVE_URL/api/preflight" | \
+    "$PROJECT_DIR/.venv/bin/python" -c '
+import json, sys
+data = json.load(sys.stdin)
+def friendly(message):
+    text = str(message or "")
+    if "All seat zones changed heavily" in text:
+        return "카메라 위치 또는 기준 이미지가 현재 장면과 다릅니다. 빈 좌석 기준 이미지를 다시 저장하세요."
+    return text
+for check in data.get("checks", []):
+    mark = "OK" if check.get("ok") else "FAIL"
+    print("[{:<4}] {}: {}".format(mark, check.get("label"), friendly(check.get("detail"))))
+print("\n결과:", "발표 준비 완료" if data.get("ready") else "조치 필요")
+raise SystemExit(0 if data.get("ready") else 1)
+'
+}
+
 health_action() {
   ensure_dashboard
 
@@ -400,9 +427,66 @@ EOF
   done
 }
 
+show_help() {
+  cat <<'EOF'
+Homebase Camera 실행 도구
+
+사용법:
+  ./homebase [명령]
+
+명령:
+  start          전체 서비스와 대시보드 실행
+  presentation   발표 전용 화면 열기
+  doctor         발표 사전 점검 실행
+  zones          실시간 좌석 구역 편집기 열기
+  baseline       현재 빈 좌석 화면을 기준 이미지로 저장
+  health         상세 실행 상태 출력
+  logs           실시간 서비스 로그 출력
+  restart        전체 서비스 재시작
+  stop           전체 서비스 종료
+  menu           번호 선택 메뉴
+  help           도움말
+EOF
+}
+
+menu_action() {
+  while true; do
+    cat <<'EOF'
+
+=== Homebase Camera 메뉴 ===
+1. 전체 실행 / 대시보드
+2. 발표 전용 화면
+3. 발표 사전 점검
+4. 좌석 구역 편집
+5. 빈 좌석 기준 이미지 저장
+6. 상세 상태
+7. 실시간 로그
+8. 전체 재시작
+9. 전체 종료
+0. 메뉴 닫기
+EOF
+    read -r -p "선택: " choice
+    case "$choice" in
+      1) start_action ;;
+      2) presentation_action ;;
+      3) doctor_action ;;
+      4) zones_action ;;
+      5) baseline_action ;;
+      6) health_action ;;
+      7) logs_action ;;
+      8) restart_action ;;
+      9) stop_action ;;
+      0) return ;;
+      *) warn "0부터 9 사이의 번호를 입력하세요." ;;
+    esac
+  done
+}
+
 case "$ACTION" in
   start) start_action ;;
   zones|zone) zones_action ;;
+  presentation|present) presentation_action ;;
+  doctor|preflight) doctor_action ;;
   health|status|check) health_action ;;
   baseline) baseline_action ;;
   logs|log) logs_action ;;

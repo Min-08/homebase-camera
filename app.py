@@ -47,7 +47,7 @@ def main() -> None:
     if demo_mode:
         st.caption("PC demo mode: generated frames and demo evidence. This is for presentation and mapping practice.")
     else:
-        st.caption("Local Raspberry Pi seat occupancy detector: 0 empty, 1 person, 2 temporarily left/object.")
+        st.caption("Local Raspberry Pi seat occupancy detector: 0 empty, 1 occupied.")
 
     for warning in config.warnings:
         st.info(warning)
@@ -111,30 +111,15 @@ def _sidebar_controls(config: AppConfig, demo_mode: bool, *, live_mode: bool):
         disabled=demo_mode or live_mode,
         help="Demo evidence is generated without YOLO. Live mode reads this setting from config/settings.toml.",
     )
-    object_enabled = st.sidebar.toggle(
-        "Object occupancy",
-        value=bool(config.detection.object_occupancy_enabled),
-        disabled=live_mode,
-        help="When disabled, status 2 is never published.",
-    )
-    conservativeness = st.sidebar.slider(
-        "Object conservativeness",
-        min_value=0,
-        max_value=10,
-        value=int(config.detection.object_conservativeness),
-        disabled=live_mode,
-        help="0 triggers status 2 easily; 10 requires stronger repeated evidence.",
-    )
-    st.sidebar.metric("YOLO interval", f"{config.detection.yolo_interval_seconds}s")
-    st.sidebar.metric("Diff interval target", f"{config.detection.diff_interval_seconds}s")
+    st.sidebar.metric("Person check interval", f"{config.detection.yolo_interval_seconds}s")
+    st.sidebar.metric("Fast change check", f"{config.detection.diff_interval_seconds}s")
+    st.sidebar.metric("Person threshold", f"{config.detection.person_confidence_threshold:.2f}")
     if live_mode:
         st.sidebar.caption("Live analysis uses config/settings.toml. Restart the service after changing detection settings.")
 
     runtime_detection = replace(
         config.detection,
         yolo_enabled=yolo_enabled,
-        object_occupancy_enabled=object_enabled,
-        object_conservativeness=conservativeness,
     )
     ui_state = {
         "auto_refresh": auto_refresh,
@@ -317,6 +302,7 @@ def _live_stream_panel(stream_info: StreamServerInfo) -> None:
         unsafe_allow_html=True,
     )
     st.caption(f"Live stream: {stream_info.stream_url}")
+    st.link_button("Open presentation view", stream_info.presentation_url)
     st.link_button("Open live zone editor", stream_info.zone_editor_url)
 
 
@@ -373,7 +359,7 @@ def _run_analysis(
             yolo_gate.mark_run(now, now_dt)
             yolo_ran = True
         else:
-            yolo_evidence = st.session_state.get("last_yolo_evidence", {})
+            yolo_evidence = {}
     else:
         yolo_evidence = {}
         st.session_state.last_yolo_evidence = {}
@@ -423,7 +409,7 @@ def _runtime_metrics(runtime: RuntimeSnapshot, runtime_detection, demo_mode: boo
         col_d.metric("Next YOLO", f"{runtime.next_yolo_seconds:.1f}s")
     else:
         col_c.metric("YOLO", "disabled")
-        col_d.metric("Mode", "demo" if demo_mode else "diff-only")
+        col_d.metric("Mode", "demo" if demo_mode else "person model off")
 
 
 def _status_card(decision: SeatDecision) -> None:
@@ -635,10 +621,9 @@ diff_interval_seconds = {runtime_detection.diff_interval_seconds}
 yolo_enabled = {runtime_detection.yolo_enabled}
 yolo_interval_seconds = {runtime_detection.yolo_interval_seconds}
 yolo_model = {runtime_detection.yolo_model}
-object_occupancy_enabled = {runtime_detection.object_occupancy_enabled}
-object_conservativeness = {runtime_detection.object_conservativeness}
-required_object_hits = {_state_engine(runtime_detection, _store(config), config.storage.db_path).required_object_hits}
-object_conf_threshold = {_state_engine(runtime_detection, _store(config), config.storage.db_path).object_conf_threshold:.2f}
+person_only_occupancy = True
+person_required_hits = {runtime_detection.person_required_hits}
+person_confidence_threshold = {runtime_detection.person_confidence_threshold:.2f}
 """.strip()
     )
     st.info("Privacy default: no raw video is saved. Status, evidence summaries, timestamps, and optional throttled snapshots are stored locally.")
@@ -679,10 +664,9 @@ def _yolo_detector(detection) -> YoloDetector:
 
 def _state_engine(detection, store: StatusStore, store_key: str) -> SeatStateEngine:
     key = (
-        detection.object_occupancy_enabled,
-        detection.object_conservativeness,
         detection.empty_required_hits,
         detection.person_required_hits,
+        detection.person_confidence_threshold,
         store_key,
     )
     if st.session_state.get("state_key") != key:

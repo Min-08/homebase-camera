@@ -38,6 +38,8 @@ def test_desktop_launcher_installer_creates_all_module_shortcuts(tmp_path: Path)
     expected_actions = {
         "Homebase Camera.desktop": "start",
         "Homebase Zone Editor.desktop": "zones",
+        "Homebase Presentation.desktop": "presentation",
+        "Homebase Preflight.desktop": "doctor --pause",
         "Homebase Health.desktop": "health --pause",
         "Homebase Empty Baseline.desktop": "baseline --pause",
         "Homebase Logs.desktop": "logs",

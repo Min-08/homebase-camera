@@ -5,6 +5,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
+import sqlite3
 import socket
 import threading
 import time
@@ -20,7 +21,7 @@ from .state_engine import SeatDecision, SeatStateEngine, ZoneEvidence
 from .storage import StatusStore
 from .validation import validate_zones
 from .visualization import draw_zones
-from .yolo_detector import YoloDetector
+from .yolo_detector import AsyncYoloDetector, YoloDetector
 from .zones import Zone, ZoneConfigError, load_zones, save_zones
 
 
@@ -35,6 +36,7 @@ class StreamServerInfo:
     stream_url: str
     zone_editor_url: str
     status_panel_url: str
+    presentation_url: str
 
 
 class LiveStreamServer:
@@ -75,6 +77,7 @@ class LiveStreamServer:
             stream_url=f"{base_url}/stream.mjpg",
             zone_editor_url=f"{base_url}/zone-editor",
             status_panel_url=f"{base_url}/status-panel",
+            presentation_url=f"{base_url}/presentation",
         )
 
 
@@ -104,11 +107,18 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
         if parsed.path in {"/", "/zone-editor"}:
             self._send_html(_zone_editor_html())
             return
         if parsed.path == "/status-panel":
             self._send_html(_status_panel_html())
+            return
+        if parsed.path == "/presentation":
+            self._send_html(_presentation_html())
             return
         if parsed.path == "/health":
             self._send_json(
@@ -142,6 +152,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     "current": self.server.analyzer.current_rows(),
                 }
             )
+            return
+        if parsed.path == "/api/preflight":
+            self._send_json(_preflight_payload(self.server))
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -270,11 +283,12 @@ class LiveAnalysisWorker:
             wal_enabled=config.storage.wal_enabled,
         )
         self.detector = DiffDetector.from_config(config.detection)
-        self.yolo = YoloDetector(
+        self.yolo_detector = YoloDetector(
             enabled=config.detection.yolo_enabled,
             model_name=config.detection.yolo_model,
             interval_seconds=config.detection.yolo_interval_seconds,
         )
+        self.yolo = AsyncYoloDetector(self.yolo_detector)
         self.engine = SeatStateEngine.from_config(config.detection)
         self.engine.restore_statuses(self.store.get_current())
         self._lock = threading.Lock()
@@ -286,10 +300,17 @@ class LiveAnalysisWorker:
         self._last_warning = ""
         self._last_zone_count = 0
         self._last_yolo_run = "never"
+        self._last_yolo_run_monotonic = 0.0
+        self._last_run_monotonic = 0.0
+        self._last_duration_ms = 0.0
+        self._analysis_valid = False
+        self._scene_valid = False
+        self._invalid_reason = "analysis has not run yet"
         self._zones: list[Zone] = []
         self._decisions: dict[str, SeatDecision] = {}
         self._evidence: dict[str, ZoneEvidence] = {}
         self._last_yolo_evidence: dict[str, ZoneEvidence] = {}
+        self._last_diff_state: dict[str, bool] = {}
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -302,18 +323,34 @@ class LiveAnalysisWorker:
         self._stop.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2)
+        self.yolo.close()
 
     def status(self) -> dict[str, object]:
         with self._lock:
+            analysis_age = None
+            if self._last_run_monotonic > 0:
+                analysis_age = max(0.0, time.monotonic() - self._last_run_monotonic)
+            yolo_age = None
+            if self._last_yolo_run_monotonic > 0:
+                yolo_age = max(0.0, time.monotonic() - self._last_yolo_run_monotonic)
             return {
                 "running": self._thread is not None and self._thread.is_alive(),
                 "last_run": self._last_run,
                 "last_error": self._last_error,
                 "last_warning": self._last_warning,
+                "valid": self._analysis_valid,
+                "scene_valid": self._scene_valid,
+                "invalid_reason": self._invalid_reason,
+                "analysis_age_seconds": analysis_age,
+                "last_duration_ms": round(self._last_duration_ms, 1),
                 "zone_count": self._last_zone_count,
                 "last_yolo_run": self._last_yolo_run,
-                "yolo_available": self.yolo.status.available,
-                "yolo_message": self.yolo.status.message,
+                "last_yolo_age_seconds": yolo_age,
+                "yolo_available": self.yolo_detector.status.available,
+                "yolo_message": self.yolo_detector.status.message,
+                "yolo_pending": self.yolo.pending,
+                "last_yolo_seconds": round(self.yolo.last_elapsed_seconds, 3),
+                "yolo_error": self.yolo.last_error,
             }
 
     def current_rows(self) -> list[dict]:
@@ -332,6 +369,8 @@ class LiveAnalysisWorker:
 
     def current_status_map(self) -> dict[str, int]:
         with self._lock:
+            if not self._analysis_valid:
+                return {zone.seat_id: -1 for zone in self._zones}
             return {seat_id: decision.status for seat_id, decision in self._decisions.items()}
 
     def current_zones(self) -> list[Zone]:
@@ -345,9 +384,30 @@ class LiveAnalysisWorker:
         with self._run_lock:
             saved = self.detector.set_baseline(frame_result.frame, save=True)
             self.engine.reset()
+            self.yolo.invalidate()
             self._last_yolo_evidence = {}
+            self._last_diff_state = {}
+            zones = _load_enabled_zones(self.config)
+            baseline_evidence = {
+                zone.seat_id: ZoneEvidence(
+                    person_checked=True,
+                    message="empty baseline reset",
+                )
+                for zone in zones
+            }
+            decisions = self.engine.update_all(zones, baseline_evidence)
+            self.store.upsert_many(decisions.values())
             with self._lock:
+                self._zones = zones
+                self._decisions = decisions
+                self._evidence = baseline_evidence
+                self._last_zone_count = len(zones)
                 self._last_warning = ""
+                self._last_yolo_run = "never"
+                self._last_yolo_run_monotonic = 0.0
+                self._analysis_valid = False
+                self._scene_valid = True
+                self._invalid_reason = "Waiting for the first person detector result."
         return {
             "ok": True,
             "path": str(saved) if saved is not None else str(self.detector.baseline_path),
@@ -367,6 +427,7 @@ class LiveAnalysisWorker:
             self._stop.wait(max(0.1, interval - elapsed))
 
     def _run_once(self) -> None:
+        started = time.monotonic()
         with self._run_lock:
             zones = _load_enabled_zones(self.config)
             frame_result = self.capture.latest_frame()
@@ -377,15 +438,56 @@ class LiveAnalysisWorker:
                     self._last_zone_count = len(zones)
                     self._last_error = "" if frame_result.ok else frame_result.message
                     self._last_run = _now_label()
+                    self._last_run_monotonic = time.monotonic()
+                    self._analysis_valid = False
+                    self._scene_valid = False
+                    self._invalid_reason = "no enabled zones" if not zones else frame_result.message
                 return
 
             diff_evidence = self.detector.analyze(frame_result.frame, zones)
-            if self.yolo.should_run():
-                self._last_yolo_evidence = self.yolo.detect(frame_result.frame, zones, force=True)
-                self._last_yolo_run = _now_label()
-            evidence = _merge_zone_evidence(diff_evidence, self._last_yolo_evidence)
-            decisions = self.engine.update_all(zones, evidence)
-            self.store.upsert_many(decisions.values())
+            diff_state = {
+                zone.seat_id: bool(diff_evidence.get(zone.seat_id, ZoneEvidence()).diff_changed)
+                for zone in zones
+            }
+            diff_valid = all(
+                diff_evidence.get(zone.seat_id, ZoneEvidence(valid=False)).valid
+                for zone in zones
+            )
+            person_model_valid = self.config.detection.yolo_enabled and self.yolo_detector.status.available
+            pipeline_valid = diff_valid and person_model_valid
+            yolo_result = self.yolo.poll()
+            yolo_evidence: dict[str, ZoneEvidence] = {}
+            if yolo_result is not None:
+                submitted_state = dict(yolo_result.submitted_diff_state)
+                current_zone_signature = tuple(sorted((zone.seat_id, tuple(zone.polygon)) for zone in zones))
+                if submitted_state == diff_state and yolo_result.submitted_zone_signature == current_zone_signature:
+                    yolo_evidence = yolo_result.evidence
+                    self._last_yolo_evidence = yolo_evidence
+                    self._last_yolo_run = _now_label()
+                    self._last_yolo_run_monotonic = time.monotonic()
+
+            if pipeline_valid:
+                evidence = _merge_zone_evidence(diff_evidence, yolo_evidence)
+                decisions = self.engine.update_all(zones, evidence)
+                self.store.upsert_many(decisions.values())
+                activity_changed = diff_state != self._last_diff_state
+                self.yolo.submit(
+                    frame_result.frame,
+                    zones,
+                    sequence=self.capture.latest_sequence(),
+                    diff_state=diff_state,
+                    urgent=activity_changed,
+                )
+            else:
+                evidence = diff_evidence
+                decisions = self._decisions or self.engine.update_all(zones, diff_evidence)
+                self.yolo.invalidate()
+                self._last_yolo_run = "never"
+                self._last_yolo_run_monotonic = 0.0
+
+            self._last_diff_state = diff_state
+            analysis_valid = pipeline_valid and self._last_yolo_run_monotonic > 0
+            finished = time.monotonic()
             with self._lock:
                 self._zones = zones
                 self._decisions = decisions
@@ -393,7 +495,21 @@ class LiveAnalysisWorker:
                 self._last_zone_count = len(zones)
                 self._last_error = ""
                 self._last_warning = self.detector.warning or ""
+                self._analysis_valid = analysis_valid
+                self._scene_valid = diff_valid
+                if analysis_valid:
+                    self._invalid_reason = ""
+                elif not diff_valid:
+                    self._invalid_reason = self.detector.warning or "analysis evidence is invalid"
+                elif not self.config.detection.yolo_enabled:
+                    self._invalid_reason = "Person detector is disabled; occupancy cannot be decided."
+                elif not person_model_valid:
+                    self._invalid_reason = self.yolo_detector.status.message
+                else:
+                    self._invalid_reason = "Waiting for the first person detector result."
                 self._last_run = _now_label()
+                self._last_run_monotonic = finished
+                self._last_duration_ms = (finished - started) * 1000
 
 
 class LiveFrameProducer:
@@ -621,6 +737,97 @@ def _parse_polygon(value: Any) -> list[tuple[int, int]]:
     return points
 
 
+def _cpu_temperature_c() -> float | None:
+    try:
+        raw = open("/sys/class/thermal/thermal_zone0/temp", encoding="ascii").read().strip()
+        return round(float(raw) / 1000.0, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def _database_integrity(path: str, root: Any) -> tuple[bool, str]:
+    resolved = resolve_path(path, root)
+    try:
+        with sqlite3.connect(resolved, timeout=2) as conn:
+            result = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+        return result.lower() == "ok", result
+    except (OSError, sqlite3.Error) as exc:
+        return False, str(exc)
+
+
+def _preflight_payload(server: _HomebaseHTTPServer) -> dict[str, Any]:
+    capture = server.capture.background_status()
+    stream = server.stream_frames.status()
+    analysis = server.analyzer.status()
+    frame_age = server.capture.frame_age_seconds()
+    analysis_age = analysis.get("analysis_age_seconds")
+    yolo_age = analysis.get("last_yolo_age_seconds")
+    max_analysis_age = max(3.0, float(server.config.detection.diff_interval_seconds) * 3.0)
+    baseline_path = server.analyzer.detector.baseline_path
+    db_ok, db_detail = _database_integrity(server.config.storage.db_path, server.config.project_root)
+    temperature = _cpu_temperature_c()
+
+    checks = [
+        {"id": "camera", "label": "카메라", "ok": bool(capture.get("running") and server.capture.latest_ok()),
+         "detail": server.capture.latest_message()},
+        {"id": "fresh_frame", "label": "실시간 프레임", "ok": frame_age is not None and frame_age < 1.0,
+         "detail": "수신 지연 없음" if frame_age is not None and frame_age < 1.0 else f"프레임 지연 {frame_age!s}초"},
+        {"id": "stream", "label": "스트리밍", "ok": bool(stream.get("running")) and not stream.get("last_error"),
+         "detail": str(stream.get("last_error") or "MJPEG 정상")},
+        {"id": "zones", "label": "좌석 구역", "ok": int(analysis.get("zone_count") or 0) > 0,
+         "detail": f"{int(analysis.get('zone_count') or 0)}개 활성"},
+        {"id": "baseline", "label": "빈 좌석 기준 이미지", "ok": baseline_path.exists(),
+         "detail": str(baseline_path)},
+        {"id": "analysis", "label": "판정 루프", "ok": bool(analysis.get("running")) and isinstance(analysis_age, int | float) and analysis_age < max_analysis_age,
+         "detail": str(analysis.get("last_error") or f"최근 {analysis_age!s}초 전")},
+        {"id": "scene", "label": "장면 정합성", "ok": bool(analysis.get("scene_valid")),
+         "detail": "정상" if analysis.get("scene_valid") else str(analysis.get("invalid_reason") or "장면 확인 필요")},
+        {"id": "yolo", "label": "사람 인식 모델", "ok": server.config.detection.yolo_enabled and bool(analysis.get("yolo_available")),
+         "detail": "설정에서 비활성화됨" if not server.config.detection.yolo_enabled else str(analysis.get("yolo_message") or "정상")},
+        {"id": "person_scan", "label": "최근 사람 검사", "ok": isinstance(yolo_age, int | float) and yolo_age < max(30.0, server.config.detection.yolo_interval_seconds * 3.0),
+         "detail": "아직 완료된 검사가 없음" if yolo_age is None else f"최근 {float(yolo_age):.1f}초 전 완료"},
+        {"id": "database", "label": "상태 데이터베이스", "ok": db_ok, "detail": db_detail},
+        {"id": "temperature", "label": "장치 온도", "ok": temperature is None or temperature < 75.0,
+         "detail": "측정 불가" if temperature is None else f"{temperature:.1f} C"},
+    ]
+    required = [check for check in checks if check["id"] != "temperature"]
+    return {
+        "ok": True,
+        "ready": all(bool(check["ok"]) for check in required),
+        "checks": checks,
+        "frame_age_seconds": frame_age,
+        "analysis_age_seconds": analysis_age,
+        "temperature_c": temperature,
+        "generated_at": _now_label(),
+    }
+
+
+def _presentation_html() -> str:
+    return r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Homebase Camera</title><style>
+:root{font-family:Arial,"Malgun Gothic",sans-serif;color:#17202a;background:#f4f6f7}*{box-sizing:border-box}
+body{margin:0}header{height:58px;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#17202a;color:#fff}
+header strong{font-size:20px}#ready{font-size:13px}.layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:14px;padding:14px;min-height:calc(100vh - 58px)}
+.camera{background:#111;display:flex;align-items:center;justify-content:center;min-height:400px}.camera img{display:block;width:100%;height:auto;max-height:calc(100vh - 86px);object-fit:contain}
+.side{background:#fff;border:1px solid #d5d8dc;padding:14px;overflow:auto}.side h1{font-size:19px;margin:0 0 12px}.summary{padding:10px;border-left:5px solid #7f8c8d;background:#f8f9f9;margin-bottom:12px}
+.seat{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #e5e7e9;padding:12px 2px}.seat span:last-child{font-weight:700}.occupied{color:#c0392b}.empty{color:#1e8449}.paused{color:#7f8c8d}
+#checks{margin-top:18px;font-size:12px;color:#566573}.check{display:flex;justify-content:space-between;gap:8px;padding:5px 0}.bad{color:#c0392b}
+@media(max-width:820px){.layout{grid-template-columns:1fr}.camera{min-height:240px}.camera img{max-height:none}}
+</style></head><body>
+<header><strong>Homebase Camera</strong><span id="ready">연결 중</span></header>
+<main class="layout"><section class="camera"><img src="/stream.mjpg" alt="실시간 카메라"></section><aside class="side">
+<h1>실시간 좌석 현황</h1><div id="summary" class="summary">판정 준비 중</div><div id="seats"></div><div id="checks"></div>
+</aside></main><script>
+function friendlyIssue(message){const text=message||'장면을 확인하세요';if(text.includes('All seat zones changed heavily'))return '카메라 위치 또는 기준 이미지가 현재 장면과 다릅니다. 빈 좌석 기준 이미지를 다시 저장하세요.';if(text.includes('baseline'))return '빈 좌석 기준 이미지를 다시 저장하세요.';if(text.includes('zone'))return '좌석 구역 설정을 확인하세요.';return text}
+async function refresh(){try{const [s,p]=await Promise.all([fetch('/api/status'),fetch('/api/preflight')]);if(!s.ok||!p.ok)throw Error('서버 응답 오류');const data=await s.json(),pre=await p.json(),analysis=data.analysis||{},valid=analysis.valid===true,rows=data.current||[];
+document.getElementById('ready').textContent=pre.ready?'발표 준비 완료':'점검 필요';document.getElementById('ready').className=pre.ready?'':'bad';
+const summary=document.getElementById('summary');summary.textContent=valid?`사람 있음 ${rows.filter(r=>r.status===1).length} / 전체 ${rows.length}`:`판정 보류: ${friendlyIssue(analysis.invalid_reason)}`;summary.style.borderLeftColor=valid?'#1e8449':'#7f8c8d';
+const seats=document.getElementById('seats');seats.textContent='';rows.forEach(r=>{const row=document.createElement('div');row.className='seat';const name=document.createElement('span');name.textContent=r.seat_name||r.seat_id;const state=document.createElement('span');state.className=!valid?'paused':r.status===1?'occupied':'empty';state.textContent=!valid?'판정 보류':r.status===1?'사람 있음':'사람 없음';row.append(name,state);seats.append(row)});
+const checks=document.getElementById('checks');checks.textContent='';(pre.checks||[]).filter(c=>!c.ok).forEach(c=>{const row=document.createElement('div');row.className='check bad';row.textContent=`${c.label}: ${friendlyIssue(c.detail)}`;checks.append(row)});}catch(e){document.getElementById('ready').textContent='연결 끊김';document.getElementById('ready').className='bad'}}
+setInterval(refresh,1000);refresh();</script></body></html>"""
+
+
 def _status_panel_html() -> str:
     return r"""<!doctype html>
 <html lang="en">
@@ -647,8 +854,8 @@ header { display: flex; justify-content: space-between; align-items: center; pad
 <div id="warning"></div>
 <div id="rows"><div class="empty">Waiting for analysis...</div></div>
 <script>
-const colors = {0:'#16a34a', 1:'#dc2626', 2:'#d97706'};
-const labels = {0:'Empty', 1:'Person', 2:'Temporarily left / object'};
+const colors = {0:'#16a34a', 1:'#dc2626'};
+const labels = {0:'사람 없음', 1:'사람 있음'};
 
 async function refresh() {
   try {
@@ -657,6 +864,7 @@ async function refresh() {
     const data = await statusRes.json();
     const health = await healthRes.json();
     const rows = data.current || [];
+    const analysisValid = data.analysis.valid === true;
     const container = document.getElementById('rows');
     container.textContent = '';
     if (!rows.length) {
@@ -668,28 +876,28 @@ async function refresh() {
     rows.forEach(row => {
       const seat = document.createElement('div');
       seat.className = 'seat';
-      seat.style.borderLeftColor = colors[row.status] || '#64748b';
+      seat.style.borderLeftColor = analysisValid ? (colors[row.status] || '#64748b') : '#64748b';
       const top = document.createElement('div');
       top.className = 'seat-top';
       const name = document.createElement('span');
       name.textContent = row.seat_name || row.seat_id;
       const value = document.createElement('span');
-      value.textContent = `status ${row.status}`;
-      value.style.color = colors[row.status] || '#64748b';
+      value.textContent = analysisValid ? `${labels[row.status] || '알 수 없음'} (${row.status})` : '판정 보류';
+      value.style.color = analysisValid ? (colors[row.status] || '#64748b') : '#64748b';
       top.append(name, value);
       const label = document.createElement('div');
       label.className = 'label';
-      label.textContent = `${labels[row.status] || 'Unknown'} / confidence ${Number(row.confidence || 0).toFixed(2)}`;
+      label.textContent = analysisValid ? (labels[row.status] || '알 수 없음') : '장면 또는 기준 이미지를 확인하세요.';
       const meta = document.createElement('div');
       meta.className = 'meta';
-      meta.textContent = row.evidence || '';
+      meta.textContent = analysisValid ? (row.evidence || '') : (data.analysis.invalid_reason || '판정 근거가 유효하지 않습니다.');
       seat.append(top, label, meta);
       container.appendChild(seat);
     });
     const captureAge = Number(health.frame_age_seconds || 0);
     document.getElementById('health').textContent = `frame ${captureAge.toFixed(2)}s / analysis ${data.analysis.last_run || 'never'}`;
     const warning = document.getElementById('warning');
-    const message = data.analysis.last_error || data.analysis.last_warning || health.stream.last_error || health.capture.last_error || '';
+    const message = data.analysis.last_error || data.analysis.invalid_reason || data.analysis.last_warning || health.stream.last_error || health.capture.last_error || '';
     warning.textContent = message;
     warning.style.display = message ? 'block' : 'none';
   } catch (err) {

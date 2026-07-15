@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .playwright-cli/
+output/
 
 config/settings.toml
 config/seats.json
@@ -14,6 +15,10 @@ data/*.db
 data/*.db-*
 data/snapshots/*
 !data/snapshots/.gitkeep
+data/models/*
+!data/models/.gitkeep
+!data/models/README.md
 
 *.log
 yolov*.pt
+*.onnx

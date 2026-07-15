@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from .config import DemoConfig, get_project_root, resolve_path
-from .state_engine import STATUS_EMPTY, STATUS_OBJECT, STATUS_PERSON, ZoneEvidence
+from .state_engine import STATUS_EMPTY, STATUS_OCCUPIED, ZoneEvidence
 from .zones import Zone, load_zones
 
 
@@ -63,7 +63,7 @@ def load_demo_timeline(config: DemoConfig) -> DemoTimeline:
         label = str(item.get("label", f"Step {index + 1}"))
         evidence = _parse_evidence(item.get("evidence", {}), index)
         expected_status = {
-            str(seat_id): int(status)
+            str(seat_id): _normalize_status(status)
             for seat_id, status in dict(item.get("expected_status", {})).items()
         }
         steps.append(DemoStep(frame=frame, label=label, evidence=evidence, expected_status=expected_status))
@@ -86,8 +86,10 @@ def load_demo_frame(step: DemoStep, config: DemoConfig) -> np.ndarray:
 def demo_evidence_for_step(step: DemoStep) -> dict[str, ZoneEvidence]:
     return {
         seat_id: ZoneEvidence(
+            valid=evidence.valid,
             diff_changed=evidence.diff_changed,
             diff_ratio=evidence.diff_ratio,
+            person_checked=evidence.person_checked,
             person_detected=evidence.person_detected,
             person_confidence=evidence.person_confidence,
             object_detected=evidence.object_detected,
@@ -107,16 +109,21 @@ def _parse_evidence(raw: Any, step_index: int) -> dict[str, ZoneEvidence]:
     for seat_id, item in raw.items():
         if not isinstance(item, dict):
             raise DemoError(f"steps[{step_index}].evidence.{seat_id} must be an object.")
-        status = int(item.get("status", STATUS_EMPTY))
+        status = _normalize_status(item.get("status", STATUS_EMPTY))
         parsed[str(seat_id)] = ZoneEvidence(
+            person_checked=True,
             diff_changed=bool(item.get("diff_changed", status != STATUS_EMPTY)),
             diff_ratio=float(item.get("diff_ratio", 0.0 if status == STATUS_EMPTY else 0.22)),
-            person_detected=status == STATUS_PERSON or bool(item.get("person_detected", False)),
-            person_confidence=float(item.get("person_confidence", 0.92 if status == STATUS_PERSON else 0.0)),
-            object_detected=status == STATUS_OBJECT or bool(item.get("object_detected", False)),
-            object_confidence=float(item.get("object_confidence", 0.82 if status == STATUS_OBJECT else 0.0)),
-            object_classes=list(item.get("object_classes", ["bag"] if status == STATUS_OBJECT else [])),
+            person_detected=bool(item.get("person_detected", False)),
+            person_confidence=float(item.get("person_confidence", 0.0)),
+            object_detected=bool(item.get("object_detected", False)),
+            object_confidence=float(item.get("object_confidence", 0.0)),
+            object_classes=list(item.get("object_classes", [])),
             source="demo",
             message=str(item.get("message", "synthetic ground truth; not real AI detection")),
         )
     return parsed
+
+
+def _normalize_status(value: Any) -> int:
+    return STATUS_EMPTY if int(value) == STATUS_EMPTY else STATUS_OCCUPIED

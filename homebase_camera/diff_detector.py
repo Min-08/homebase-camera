@@ -25,6 +25,7 @@ class DiffDetector:
         self._baseline: np.ndarray | None = None
         self._temporary_baseline = False
         self.warning: str | None = None
+        self._baseline_invalid = False
 
     @classmethod
     def from_config(cls, config: DetectionConfig) -> "DiffDetector":
@@ -37,6 +38,15 @@ class DiffDetector:
     def analyze(self, frame: np.ndarray, zones: Iterable[Zone]) -> dict[str, ZoneEvidence]:
         baseline = self._get_baseline(frame)
         if baseline is None:
+            if self._baseline_invalid:
+                self.warning = (
+                    "The saved baseline image is not usable for detection. "
+                    "Capture a real empty camera view from the live zone editor."
+                )
+                return {
+                    zone.seat_id: ZoneEvidence(valid=False, message="invalid baseline; capture an empty baseline")
+                    for zone in zones
+                }
             self._baseline = frame.copy()
             self._temporary_baseline = True
             baseline_problem = self.warning
@@ -51,7 +61,7 @@ class DiffDetector:
                 )
             self.warning = fallback_warning
             return {
-                zone.seat_id: ZoneEvidence(message="temporary baseline initialized")
+                zone.seat_id: ZoneEvidence(valid=False, message="temporary baseline initialized")
                 for zone in zones
             }
 
@@ -75,15 +85,42 @@ class DiffDetector:
         diff = np.abs(current_gray.astype(np.int16) - baseline_gray.astype(np.int16)).astype(np.uint8)
         changed = diff > self.diff_threshold
 
-        results: dict[str, ZoneEvidence] = {}
+        zone_ratios: list[tuple[Zone, float | None]] = []
+        combined_mask = np.zeros(current_gray.shape, dtype=bool)
         for zone in zones:
             mask = create_polygon_mask(current_gray.shape, zone.polygon)
             masked_pixels = int(mask.sum())
             if masked_pixels == 0:
-                results[zone.seat_id] = ZoneEvidence(message="zone mask is empty")
+                zone_ratios.append((zone, None))
                 continue
 
+            combined_mask |= mask
             ratio = float(changed[mask].sum() / masked_pixels)
+            zone_ratios.append((zone, ratio))
+
+        valid_ratios = [ratio for _, ratio in zone_ratios if ratio is not None]
+        background_ratio = _background_change_ratio(changed, combined_mask)
+        if _looks_like_scene_mismatch(valid_ratios, background_ratio, self.change_ratio_threshold):
+            self.warning = (
+                "All seat zones changed heavily compared with the baseline. "
+                "The camera may have moved or the baseline was captured from a different scene. "
+                "Capture a new empty baseline before trusting occupancy status."
+            )
+            return {
+                zone.seat_id: ZoneEvidence(
+                    valid=False,
+                    diff_ratio=float(ratio or 0.0),
+                    source="diff",
+                    message="baseline mismatch; capture a new empty baseline",
+                )
+                for zone, ratio in zone_ratios
+            }
+
+        results: dict[str, ZoneEvidence] = {}
+        for zone, ratio in zone_ratios:
+            if ratio is None:
+                results[zone.seat_id] = ZoneEvidence(valid=False, message="zone mask is empty")
+                continue
             results[zone.seat_id] = ZoneEvidence(
                 diff_changed=ratio >= self.change_ratio_threshold,
                 diff_ratio=ratio,
@@ -96,6 +133,7 @@ class DiffDetector:
     def set_baseline(self, frame: np.ndarray, *, save: bool = True) -> Path | None:
         self._baseline = frame.copy()
         self._temporary_baseline = False
+        self._baseline_invalid = False
         self.warning = None
         if not save:
             return None
@@ -109,11 +147,17 @@ class DiffDetector:
         if not self.baseline_path.exists():
             return None
         try:
-            self._baseline = np.asarray(Image.open(self.baseline_path).convert("RGB"))
+            baseline = np.asarray(Image.open(self.baseline_path).convert("RGB"))
             self._temporary_baseline = False
         except OSError as exc:
             self.warning = f"Could not read baseline image: {exc}"
             return None
+        quality_warning = _baseline_quality_warning(baseline)
+        if quality_warning:
+            self._baseline_invalid = True
+            self.warning = quality_warning
+            return None
+        self._baseline = baseline
         return self._baseline
 
 
@@ -136,3 +180,37 @@ def _resize_to_match(source: np.ndarray, target: np.ndarray) -> np.ndarray:
         return source
     width, height = int(target.shape[1]), int(target.shape[0])
     return np.asarray(Image.fromarray(_ensure_rgb(source)).resize((width, height), Image.Resampling.BILINEAR))
+
+
+def _background_change_ratio(changed: np.ndarray, combined_zone_mask: np.ndarray) -> float:
+    background = ~combined_zone_mask
+    count = int(background.sum())
+    if count == 0:
+        return 0.0
+    return float(changed[background].sum() / count)
+
+
+def _looks_like_scene_mismatch(ratios: list[float], background_ratio: float, change_ratio_threshold: float) -> bool:
+    if len(ratios) < 2:
+        return False
+    moderate_zone_threshold = max(0.08, change_ratio_threshold * 2.0)
+    background_threshold = max(0.03, change_ratio_threshold * 0.75)
+    if background_ratio < background_threshold:
+        return False
+    if all(ratio >= 0.25 for ratio in ratios):
+        return True
+    changed_zones = sum(ratio >= moderate_zone_threshold for ratio in ratios)
+    return changed_zones >= max(2, len(ratios) - 1)
+
+
+def _baseline_quality_warning(frame: np.ndarray) -> str | None:
+    gray = _to_gray(frame)
+    mean = float(gray.mean())
+    stddev = float(gray.std())
+    if mean <= 5.0:
+        return "Saved baseline image is nearly black; it looks like a blank file, not an empty camera view."
+    if mean >= 250.0:
+        return "Saved baseline image is nearly white; it looks like a blank file, not an empty camera view."
+    if stddev <= 2.0:
+        return "Saved baseline image has almost no visual detail; capture a real empty camera view."
+    return None

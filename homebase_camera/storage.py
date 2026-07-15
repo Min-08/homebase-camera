@@ -12,7 +12,7 @@ from .state_engine import SeatDecision
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS current_status(
   seat_id TEXT PRIMARY KEY,
-  status INTEGER NOT NULL,
+  status INTEGER NOT NULL CHECK(status IN (0, 1)),
   confidence REAL NOT NULL,
   evidence TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS current_status(
 CREATE TABLE IF NOT EXISTS status_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   seat_id TEXT NOT NULL,
-  status INTEGER NOT NULL,
+  status INTEGER NOT NULL CHECK(status IN (0, 1)),
   confidence REAL NOT NULL,
   evidence TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -53,6 +53,9 @@ class StatusStore:
     def _init_db(self, conn: sqlite3.Connection) -> None:
         self._configure_connection(conn, configure_journal=True)
         conn.executescript(SCHEMA)
+        conn.execute("UPDATE current_status SET status = CASE WHEN status = 0 THEN 0 ELSE 1 END")
+        conn.execute("UPDATE status_log SET status = CASE WHEN status = 0 THEN 0 ELSE 1 END")
+        conn.execute("PRAGMA user_version = 2")
 
     def upsert_many(self, decisions: Iterable[SeatDecision]) -> None:
         self._write_with_retry(lambda conn: [self._upsert(conn, decision) for decision in decisions])
@@ -90,6 +93,7 @@ class StatusStore:
         return {"journal_mode": journal_mode, "busy_timeout": busy_timeout}
 
     def _upsert(self, conn: sqlite3.Connection, decision: SeatDecision) -> None:
+        normalized_status = 0 if int(decision.status) == 0 else 1
         previous = conn.execute(
             "SELECT status FROM current_status WHERE seat_id = ?",
             (decision.seat_id,),
@@ -104,15 +108,15 @@ class StatusStore:
                 evidence = excluded.evidence,
                 updated_at = excluded.updated_at
             """,
-            (decision.seat_id, decision.status, decision.confidence, decision.evidence, decision.updated_at),
+            (decision.seat_id, normalized_status, decision.confidence, decision.evidence, decision.updated_at),
         )
-        if previous is None or int(previous["status"]) != int(decision.status):
+        if previous is None or int(previous["status"]) != normalized_status:
             conn.execute(
                 """
                 INSERT INTO status_log(seat_id, status, confidence, evidence, created_at)
                 VALUES(?, ?, ?, ?, ?)
                 """,
-                (decision.seat_id, decision.status, decision.confidence, decision.evidence, decision.updated_at),
+                (decision.seat_id, normalized_status, decision.confidence, decision.evidence, decision.updated_at),
             )
 
     def _connect(self) -> sqlite3.Connection:

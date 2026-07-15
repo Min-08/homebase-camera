@@ -33,14 +33,15 @@ class CameraConfig:
 
 @dataclass(frozen=True)
 class DetectionConfig:
-    diff_interval_seconds: int = 3
+    diff_interval_seconds: int = 1
     yolo_enabled: bool = True
-    yolo_interval_seconds: int = 20
-    yolo_model: str = "yolov8n.pt"
-    object_occupancy_enabled: bool = True
-    object_conservativeness: int = 5
+    yolo_interval_seconds: int = 8
+    yolo_model: str = "data/models/yolov8n.onnx"
+    object_occupancy_enabled: bool = False
+    object_conservativeness: int = 0
     empty_required_hits: int = 2
     person_required_hits: int = 1
+    person_confidence_threshold: float = 0.25
     diff_threshold: int = 30
     change_ratio_threshold: float = 0.04
     baseline_path: str = "data/snapshots/baseline.jpg"
@@ -191,6 +192,7 @@ def _validate_detection(config: DetectionConfig) -> DetectionConfig:
     person_hits = _as_int(config.person_required_hits, "person_required_hits")
     diff_threshold = _as_int(config.diff_threshold, "diff_threshold")
     change_ratio = _as_float(config.change_ratio_threshold, "change_ratio_threshold")
+    person_threshold = _as_float(config.person_confidence_threshold, "person_confidence_threshold")
 
     if not 0 <= conservativeness <= 10:
         raise ConfigError("object_conservativeness must be between 0 and 10.")
@@ -205,6 +207,8 @@ def _validate_detection(config: DetectionConfig) -> DetectionConfig:
         raise ConfigError("diff_threshold must be between 0 and 255.")
     if not 0 < change_ratio <= 1:
         raise ConfigError("change_ratio_threshold must be greater than 0 and less than or equal to 1.")
+    if not 0 < person_threshold <= 1:
+        raise ConfigError("person_confidence_threshold must be greater than 0 and less than or equal to 1.")
 
     return replace(
         config,
@@ -215,6 +219,7 @@ def _validate_detection(config: DetectionConfig) -> DetectionConfig:
         person_required_hits=person_hits,
         diff_threshold=diff_threshold,
         change_ratio_threshold=change_ratio,
+        person_confidence_threshold=person_threshold,
     )
 
 

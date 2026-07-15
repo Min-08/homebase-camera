@@ -9,21 +9,22 @@ from .zones import Zone
 
 
 STATUS_EMPTY = 0
-STATUS_PERSON = 1
-STATUS_OBJECT = 2
+STATUS_OCCUPIED = 1
+STATUS_PERSON = STATUS_OCCUPIED
 
 
 STATUS_LABELS = {
     STATUS_EMPTY: "Empty / available",
-    STATUS_PERSON: "Occupied by person",
-    STATUS_OBJECT: "Temporarily left / object occupancy",
+    STATUS_OCCUPIED: "Occupied",
 }
 
 
 @dataclass
 class ZoneEvidence:
+    valid: bool = True
     diff_changed: bool = False
     diff_ratio: float = 0.0
+    person_checked: bool = False
     person_detected: bool = False
     person_confidence: float = 0.0
     object_detected: bool = False
@@ -35,8 +36,10 @@ class ZoneEvidence:
     def merge(self, other: "ZoneEvidence") -> "ZoneEvidence":
         classes = sorted(set(self.object_classes + other.object_classes))
         return ZoneEvidence(
+            valid=self.valid and other.valid,
             diff_changed=self.diff_changed or other.diff_changed,
             diff_ratio=max(float(self.diff_ratio), float(other.diff_ratio)),
+            person_checked=self.person_checked or other.person_checked,
             person_detected=self.person_detected or other.person_detected,
             person_confidence=max(float(self.person_confidence), float(other.person_confidence)),
             object_detected=self.object_detected or other.object_detected,
@@ -61,7 +64,7 @@ class SeatDecision:
 class _SeatHistory:
     status: int = STATUS_EMPTY
     person_hits: int = 0
-    object_hits: int = 0
+    occupied_hits: int = 0
     empty_hits: int = 0
     last_confidence: float = 0.0
 
@@ -74,13 +77,17 @@ class SeatStateEngine:
         object_conservativeness: int = 5,
         empty_required_hits: int = 2,
         person_required_hits: int = 1,
+        person_confidence_threshold: float = 0.25,
     ) -> None:
         if not 0 <= int(object_conservativeness) <= 10:
             raise ValueError("object_conservativeness must be from 0 to 10.")
-        self.object_occupancy_enabled = bool(object_occupancy_enabled)
+        # Legacy object settings remain accepted so older settings files still load,
+        # but binary occupancy is intentionally person-only.
+        self.object_occupancy_enabled = False
         self.object_conservativeness = int(object_conservativeness)
         self.empty_required_hits = max(1, int(empty_required_hits))
         self.person_required_hits = max(1, int(person_required_hits))
+        self.person_confidence_threshold = min(1.0, max(0.01, float(person_confidence_threshold)))
         self._history: dict[str, _SeatHistory] = {}
 
     @classmethod
@@ -90,15 +97,24 @@ class SeatStateEngine:
             object_conservativeness=config.object_conservativeness,
             empty_required_hits=config.empty_required_hits,
             person_required_hits=config.person_required_hits,
+            person_confidence_threshold=config.person_confidence_threshold,
         )
 
     @property
     def required_object_hits(self) -> int:
-        return round(1 + self.object_conservativeness * 0.5)
+        return 0
+
+    @property
+    def required_occupied_hits(self) -> int:
+        return self.person_required_hits
 
     @property
     def object_conf_threshold(self) -> float:
-        return 0.25 + self.object_conservativeness * 0.04
+        return self.person_confidence_threshold
+
+    @property
+    def occupied_conf_threshold(self) -> float:
+        return self.person_confidence_threshold
 
     def reset(self) -> None:
         self._history.clear()
@@ -109,11 +125,13 @@ class SeatStateEngine:
             if not seat_id:
                 continue
             status = int(row.get("status", STATUS_EMPTY))
+            if status != STATUS_EMPTY:
+                status = STATUS_OCCUPIED
             confidence = float(row.get("confidence", 0.0) or 0.0)
             self._history[seat_id] = _SeatHistory(
                 status=status,
-                person_hits=self.person_required_hits if status == STATUS_PERSON else 0,
-                object_hits=self.required_object_hits if status == STATUS_OBJECT else 0,
+                person_hits=self.person_required_hits if status == STATUS_OCCUPIED else 0,
+                occupied_hits=0,
                 empty_hits=self.empty_required_hits if status == STATUS_EMPTY else 0,
                 last_confidence=confidence,
             )
@@ -130,46 +148,53 @@ class SeatStateEngine:
 
     def update(self, zone: Zone, evidence: ZoneEvidence) -> SeatDecision:
         history = self._history.setdefault(zone.seat_id, _SeatHistory())
-        person_signal = evidence.person_detected and evidence.person_confidence >= 0.20
-        object_signal, object_confidence, object_reason = self._object_signal(evidence)
+        if not evidence.valid:
+            reason = "analysis invalid; preserving previous status"
+            return self._decision(zone, history, evidence, reason)
+
+        person_signal = (
+            evidence.person_checked
+            and evidence.person_detected
+            and evidence.person_confidence >= self.person_confidence_threshold
+        )
 
         if person_signal:
-            history.person_hits += 1
-            history.object_hits = 0
+            history.person_hits = min(self.person_required_hits, history.person_hits + 1)
+            history.occupied_hits = 0
             history.empty_hits = 0
             if history.person_hits >= self.person_required_hits:
-                history.status = STATUS_PERSON
+                history.status = STATUS_OCCUPIED
                 history.last_confidence = max(0.70, evidence.person_confidence)
             reason = f"person evidence {history.person_hits}/{self.person_required_hits}"
 
-        elif self.object_occupancy_enabled and object_signal:
+        elif evidence.person_checked:
             history.person_hits = 0
-            history.empty_hits = 0
-            history.object_hits += 1
-            if history.object_hits >= self.required_object_hits:
-                history.status = STATUS_OBJECT
-                history.last_confidence = object_confidence
-            reason = f"{object_reason}; object hits {history.object_hits}/{self.required_object_hits}"
+            history.occupied_hits = 0
+            history.empty_hits = min(self.empty_required_hits, history.empty_hits + 1)
+
+            required_empty_hits = 1 if not evidence.diff_changed else self.empty_required_hits
+
+            if history.empty_hits >= required_empty_hits:
+                history.status = STATUS_EMPTY
+                history.last_confidence = max(0.70, 1.0 - evidence.person_confidence)
+
+            reason = f"person not detected {history.empty_hits}/{required_empty_hits}"
 
         else:
             history.person_hits = 0
-            history.object_hits = 0
-            if not self.object_occupancy_enabled or not evidence.diff_changed:
-                history.empty_hits += 1
-            else:
-                history.empty_hits = 0
+            history.occupied_hits = 0
+            history.empty_hits = 0
+            reason = "awaiting person detector; preserving previous status"
 
-            if history.empty_hits >= self.empty_required_hits:
-                history.status = STATUS_EMPTY
-                history.last_confidence = max(0.30, 1.0 - evidence.diff_ratio)
+        return self._decision(zone, history, evidence, reason)
 
-            if not self.object_occupancy_enabled and (evidence.object_detected or evidence.diff_changed):
-                reason = "object occupancy disabled; object-only evidence is not published"
-            elif evidence.diff_changed:
-                reason = "changed zone, but object evidence is below threshold"
-            else:
-                reason = f"empty evidence {history.empty_hits}/{self.empty_required_hits}"
-
+    def _decision(
+        self,
+        zone: Zone,
+        history: _SeatHistory,
+        evidence: ZoneEvidence,
+        reason: str,
+    ) -> SeatDecision:
         return SeatDecision(
             seat_id=zone.seat_id,
             seat_name=zone.seat_name,
@@ -179,26 +204,13 @@ class SeatStateEngine:
             updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
         )
 
-    def _object_signal(self, evidence: ZoneEvidence) -> tuple[bool, float, str]:
-        threshold = self.object_conf_threshold
-        if evidence.object_detected and evidence.object_confidence >= threshold:
-            classes = ", ".join(evidence.object_classes) if evidence.object_classes else "object"
-            return True, evidence.object_confidence, f"YOLO object ({classes}) confidence {evidence.object_confidence:.2f}"
-
-        # Diff-only mode cannot identify the object class, but persistent localized change is useful
-        # for a prototype when YOLO is missing or too slow on Raspberry Pi.
-        if evidence.diff_changed and not evidence.person_detected:
-            diff_confidence = min(0.95, 0.25 + evidence.diff_ratio * 5.0)
-            if diff_confidence >= threshold:
-                return True, diff_confidence, f"diff-only object candidate ratio {evidence.diff_ratio:.3f}"
-
-        return False, 0.0, "no strong object evidence"
-
     def _summarize_evidence(self, evidence: ZoneEvidence, reason: str) -> str:
         parts = [
             reason,
             f"diff_ratio={evidence.diff_ratio:.3f}",
-            f"person={evidence.person_confidence:.2f}" if evidence.person_detected else "person=none",
+            f"person={evidence.person_confidence:.2f}" if evidence.person_detected else (
+                "person=not-detected" if evidence.person_checked else "person=not-checked"
+            ),
             f"object={evidence.object_confidence:.2f}" if evidence.object_detected else "object=none",
         ]
         if evidence.object_classes:

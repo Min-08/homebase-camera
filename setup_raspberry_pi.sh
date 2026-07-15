@@ -11,6 +11,7 @@ fi
 
 INSTALL_SYSTEM_PACKAGES=0
 INSTALL_LAUNCHERS=0
+INSTALL_YOLO_MODEL=0
 for arg in "$@"; do
   case "$arg" in
     --install-system-packages)
@@ -19,12 +20,16 @@ for arg in "$@"; do
     --install-launchers)
       INSTALL_LAUNCHERS=1
       ;;
+    --install-yolo-model)
+      INSTALL_YOLO_MODEL=1
+      ;;
     -h|--help)
-      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages] [--install-launchers]"
+      echo "Usage: ./setup_raspberry_pi.sh [--install-system-packages] [--install-launchers] [--install-yolo-model]"
       echo ""
       echo "  --install-system-packages  Also install Raspberry Pi OS packages:"
       echo "                             python3, python3-venv, python3-picamera2, python3-opencv, curl"
       echo "  --install-launchers        Install one-click desktop and application-menu launchers"
+      echo "  --install-yolo-model       Download and checksum-verify the pinned person detector model"
       exit 0
       ;;
     *)
@@ -130,6 +135,10 @@ fi
 
 if [[ "$INSTALL_LAUNCHERS" == "1" ]]; then
   ./scripts/install_desktop_launcher.sh
+fi
+
+if [[ "$INSTALL_YOLO_MODEL" == "1" ]]; then
+  python tools/install_yolo_model.py
 fi
 
 echo ""

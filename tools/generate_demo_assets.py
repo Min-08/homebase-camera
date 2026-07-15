@@ -49,13 +49,15 @@ TIMELINE = [
     },
     {
         "frame": "002_object_seat_1.jpg",
-        "label": "Seat 1 temporarily left with bag",
-        "states": {"seat_001": 2, "seat_002": 0, "seat_003": 0},
+        "label": "Bag only in Seat 1; no person",
+        "states": {"seat_001": 0, "seat_002": 0, "seat_003": 0},
+        "object_seats": ["seat_001"],
     },
     {
         "frame": "003_mixed.jpg",
-        "label": "Mixed occupancy",
-        "states": {"seat_001": 2, "seat_002": 1, "seat_003": 0},
+        "label": "Bag in Seat 1, person in Seat 2",
+        "states": {"seat_001": 0, "seat_002": 1, "seat_003": 0},
+        "object_seats": ["seat_001"],
     },
     {
         "frame": "004_empty_again.jpg",
@@ -106,7 +108,12 @@ def generate_demo_assets(root: Path = ROOT, *, force: bool = False) -> Generatio
         draw = ImageDraw.Draw(image)
         for zone in ZONES:
             state = int(step["states"][zone["seat_id"]])
-            _draw_zone_state(draw, zone, state)
+            _draw_zone_state(
+                draw,
+                zone,
+                state,
+                object_present=zone["seat_id"] in step.get("object_seats", []),
+            )
         image.save(target, quality=92)
         generated.append(target)
 
@@ -154,15 +161,15 @@ def _base_scene(label: str) -> Image.Image:
     return image
 
 
-def _draw_zone_state(draw: ImageDraw.ImageDraw, zone: dict, state: int) -> None:
+def _draw_zone_state(draw: ImageDraw.ImageDraw, zone: dict, state: int, *, object_present: bool = False) -> None:
     points = [tuple(point) for point in zone["polygon"]]
     x1 = min(x for x, _ in points)
     y1 = min(y for _, y in points)
     x2 = max(x for x, _ in points)
     y2 = max(y for _, y in points)
-    colors = {0: "#16a34a", 1: "#2563eb", 2: "#d97706"}
-    fills = {0: "#dcfce7", 1: "#dbeafe", 2: "#fef3c7"}
-    labels = {0: "Empty", 1: "Person", 2: "Object"}
+    colors = {0: "#16a34a", 1: "#dc2626"}
+    fills = {0: "#dcfce7", 1: "#fee2e2"}
+    labels = {0: "No person", 1: "Person present"}
 
     draw.polygon(points, fill=fills[state], outline=colors[state])
     draw.line(points + [points[0]], fill=colors[state], width=4)
@@ -173,9 +180,10 @@ def _draw_zone_state(draw: ImageDraw.ImageDraw, zone: dict, state: int) -> None:
         cx = (x1 + x2) // 2
         draw.ellipse((cx - 32, y1 + 58, cx + 32, y1 + 122), fill="#60a5fa", outline="#1d4ed8", width=3)
         draw.rounded_rectangle((cx - 58, y1 + 122, cx + 58, y2 - 34), radius=28, fill="#2563eb")
-    elif state == 2:
+    elif object_present:
         draw.rounded_rectangle((x1 + 82, y1 + 78, x2 - 82, y2 - 70), radius=18, fill="#f59e0b", outline="#92400e", width=3)
         draw.arc((x1 + 118, y1 + 48, x2 - 118, y1 + 118), 180, 360, fill="#92400e", width=5)
+        draw.text((x1 + 12, y1 + 60), "Object only", fill="#92400e")
     else:
         draw.rounded_rectangle((x1 + 76, y1 + 95, x2 - 76, y2 - 60), radius=12, outline="#16a34a", width=3)
 
@@ -183,15 +191,17 @@ def _draw_zone_state(draw: ImageDraw.ImageDraw, zone: dict, state: int) -> None:
 def _timeline_step(step: dict) -> dict:
     evidence = {}
     for seat_id, status in step["states"].items():
+        object_present = seat_id in step.get("object_seats", [])
         evidence[seat_id] = {
             "status": status,
             "diff_changed": status != 0,
             "diff_ratio": 0.0 if status == 0 else 0.25,
             "person_detected": status == 1,
             "person_confidence": 0.92 if status == 1 else 0.0,
-            "object_detected": status == 2,
-            "object_confidence": 0.86 if status == 2 else 0.0,
-            "object_classes": ["backpack"] if status == 2 else [],
+            "person_checked": True,
+            "object_detected": object_present,
+            "object_confidence": 0.86 if object_present else 0.0,
+            "object_classes": ["backpack"] if object_present else [],
             "message": "synthetic demo evidence; not real AI detection",
         }
     return {
